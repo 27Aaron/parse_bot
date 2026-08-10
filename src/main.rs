@@ -3,12 +3,14 @@ use parse_bot::{
     config::Config,
     media::MediaDownloader,
     storage::MediaCache,
-    telegram::{BotService, TelegramClient},
+    telegram::{BotService, TdlibConfig, TelegramClient},
     wechat::WechatResolver,
 };
 use tokio_util::sync::CancellationToken;
-use tracing::info;
+use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
+
+const BOT_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(40);
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -18,10 +20,6 @@ async fn main() -> Result<()> {
     let mut config = Config::from_env()?;
     config.prepare_paths()?;
 
-    let telegram = TelegramClient::new(
-        config.telegram_api_url.clone(),
-        config.telegram_bot_token.clone(),
-    )?;
     let resolver = WechatResolver::new(
         config.wechat_yuanbao_cookie.clone(),
         config.wechat_resolve_timeout,
@@ -35,9 +33,18 @@ async fn main() -> Result<()> {
         config.wechat_download_timeout,
     )?;
     let cache = MediaCache::open(&config.database_path)?;
+    let telegram = TelegramClient::connect(TdlibConfig {
+        api_id: config.telegram_api_id,
+        api_hash: config.telegram_api_hash,
+        bot_token: config.telegram_bot_token,
+        database_directory: config.tdlib_database_dir,
+        files_directory: config.tdlib_files_dir,
+        cover_downloader: downloader.clone(),
+    })
+    .await?;
 
     let bot = BotService::new(
-        telegram,
+        telegram.clone(),
         resolver,
         downloader,
         cache,
@@ -48,15 +55,52 @@ async fn main() -> Result<()> {
     let shutdown = CancellationToken::new();
     let run = bot.run(shutdown.clone());
     tokio::pin!(run);
-    tokio::select! {
+    let run_result = tokio::select! {
         result = &mut run => result,
-        signal = tokio::signal::ctrl_c() => {
-            signal?;
-            info!("收到退出信号");
+        signal = shutdown_signal() => {
             shutdown.cancel();
-            run.await
+            match signal {
+                Ok(()) => {
+                    info!("收到退出信号");
+                    match tokio::time::timeout(BOT_SHUTDOWN_TIMEOUT, &mut run).await {
+                        Ok(result) => result,
+                        Err(_) => {
+                            warn!("Bot 清理超时，继续关闭 TDLib");
+                            Err(AppError::Telegram("bot shutdown timed out".into()))
+                        }
+                    }
+                }
+                Err(error) => {
+                    let _ = tokio::time::timeout(BOT_SHUTDOWN_TIMEOUT, &mut run).await;
+                    Err(AppError::Io(error))
+                }
+            }
+        }
+    };
+
+    let close_result = telegram.close().await.map_err(AppError::from);
+    match (run_result, close_result) {
+        (Ok(()), result) => result,
+        (Err(error), Ok(())) => Err(error),
+        (Err(error), Err(close_error)) => {
+            warn!(error = %close_error, "关闭 TDLib 时发生额外错误");
+            Err(error)
         }
     }
+}
+
+#[cfg(unix)]
+async fn shutdown_signal() -> std::io::Result<()> {
+    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    tokio::select! {
+        result = tokio::signal::ctrl_c() => result,
+        _ = terminate.recv() => Ok(()),
+    }
+}
+
+#[cfg(not(unix))]
+async fn shutdown_signal() -> std::io::Result<()> {
+    tokio::signal::ctrl_c().await
 }
 
 fn load_local_environment() -> Result<()> {

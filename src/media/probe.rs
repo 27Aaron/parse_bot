@@ -206,7 +206,7 @@ fn parse_probe_json(json: &[u8]) -> Result<MediaProbe> {
 
 fn visible_dimensions(stream: &ProbeStream, coded_width: u32, coded_height: u32) -> (u32, u32) {
     // Keep the coded dimensions when optional metadata is malformed or its
-    // result cannot be represented by the Bot API metadata types.
+    // result cannot be represented by Telegram's metadata types.
     let display_width = stream
         .sample_aspect_ratio
         .as_ref()
