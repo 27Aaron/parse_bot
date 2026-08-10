@@ -11,12 +11,12 @@ use uuid::Uuid;
 
 use crate::{
     AppError, Result,
-    media::{MediaDownloader, decrypt_file_prefix, probe_media},
+    media::{MediaDownloader, MediaProbe, decrypt_file_prefix, probe_media},
     model::{MediaVariant, ResolvedPost, TelegramMediaKind, VideoCodec},
     storage::MediaCache,
     telegram::api::{
         CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, InputFile, Message,
-        TelegramClient, TelegramError, Update,
+        TelegramClient, TelegramError, Update, VideoMetadata, escape_html,
     },
     wechat::WechatResolver,
 };
@@ -42,6 +42,7 @@ pub struct BotService {
 struct PendingDownload {
     owner_user_id: u64,
     chat_id: i64,
+    source_message_id: i64,
     status_message_id: i64,
     post: Arc<ResolvedPost>,
     expires_at: Instant,
@@ -146,18 +147,24 @@ impl BotService {
                 self.telegram
                     .send_message(
                         chat_id,
-                        "发送微信视频号链接或分享文案，我会解析后提供“下载视频”和“下载原视频”按钮。\n\n新文件最大支持 2000 MB；大文件需要自建 telegram-bot-api --local。",
+                        "发送微信视频号链接或分享文案，我会解析后让你选择普通画质或原画质。\n\n新文件最大支持 2000 MB；大文件需要自建 telegram-bot-api --local。",
                         None,
                     )
                     .await?;
             }
             Some("parse") => {
                 let inline = text.split_once(char::is_whitespace).map(|(_, value)| value);
-                let input = inline
+                let replied = message
+                    .reply_to_message
+                    .as_deref()
+                    .and_then(|reply| reply.text.as_deref().map(|text| (text, reply.message_id)));
+                let (input, source_message_id) = inline
                     .filter(|value| !value.trim().is_empty())
-                    .or_else(|| message.reply_text())
+                    .map(|value| (value, message.message_id))
+                    .or(replied)
                     .ok_or(AppError::UnsupportedUrl)?;
-                self.begin_parse(chat_id, user_id, input).await?;
+                self.begin_parse(chat_id, user_id, source_message_id, input)
+                    .await?;
             }
             Some("status") => {
                 let active = self.active_tasks.lock().await.contains_key(&user_id);
@@ -190,15 +197,24 @@ impl BotService {
                     .send_message(chat_id, "暂不支持这个命令。发送 /start 查看用法。", None)
                     .await?;
             }
-            None => self.begin_parse(chat_id, user_id, text).await?,
+            None => {
+                self.begin_parse(chat_id, user_id, message.message_id, text)
+                    .await?
+            }
         }
         Ok(())
     }
 
-    async fn begin_parse(&self, chat_id: i64, user_id: u64, input: &str) -> Result<()> {
+    async fn begin_parse(
+        &self,
+        chat_id: i64,
+        user_id: u64,
+        source_message_id: i64,
+        input: &str,
+    ) -> Result<()> {
         let status = self
             .telegram
-            .send_message(chat_id, "正在解析链接…", None)
+            .send_message_reply(chat_id, "正在解析链接…", source_message_id, None)
             .await?;
         let _permit = self
             .resolve_slots
@@ -219,12 +235,12 @@ impl BotService {
 
         let nonce = Uuid::new_v4().simple().to_string();
         let mut buttons = vec![InlineKeyboardButton::callback(
-            "下载视频",
+            "普通画质",
             format!("dl:{nonce}:c"),
         )];
         if post.original.is_some() {
             buttons.push(InlineKeyboardButton::callback(
-                "下载原视频",
+                "原画质",
                 format!("dl:{nonce}:o"),
             ));
         }
@@ -246,6 +262,7 @@ impl BotService {
             PendingDownload {
                 owner_user_id: user_id,
                 chat_id,
+                source_message_id,
                 status_message_id: status.message_id,
                 post,
                 expires_at: Instant::now() + self.callback_ttl,
@@ -411,7 +428,7 @@ impl BotService {
         if cancellation.is_cancelled() {
             return Err(AppError::Cancelled);
         }
-        let caption = pending.post.display_title();
+        let caption = format_caption(&pending.post);
         if let Some(cached) = self
             .cache
             .get(&pending.post.platform, &pending.post.post_id, variant)
@@ -425,6 +442,8 @@ impl BotService {
                     cached.kind,
                     &input,
                     &caption,
+                    pending.source_message_id,
+                    None,
                 ) => result,
             };
             match cached_send {
@@ -528,13 +547,8 @@ impl BotService {
                 result = probe_media(&downloaded.path) => result?,
             };
 
-            let kind = match variant {
-                MediaVariant::Original => TelegramMediaKind::Document,
-                MediaVariant::Compatible if probe.codec == VideoCodec::H264 => {
-                    TelegramMediaKind::Video
-                }
-                MediaVariant::Compatible => TelegramMediaKind::Document,
-            };
+            let kind = telegram_media_kind(probe.codec);
+            let video_metadata = telegram_video_metadata(&probe);
             self.telegram
                 .edit_message_text(
                     pending.chat_id,
@@ -552,6 +566,8 @@ impl BotService {
                     kind,
                     &input,
                     &caption,
+                    pending.source_message_id,
+                    Some(video_metadata),
                 ) => result,
             };
             let sent = match send_result {
@@ -566,6 +582,8 @@ impl BotService {
                             TelegramMediaKind::Document,
                             &input,
                             &caption,
+                            pending.source_message_id,
+                            None,
                         ) => result?,
                     }
                 }
@@ -610,16 +628,44 @@ impl BotService {
         kind: TelegramMediaKind,
         input: &InputFile,
         caption: &str,
+        reply_to_message_id: i64,
+        video_metadata: Option<VideoMetadata>,
     ) -> std::result::Result<Message, TelegramError> {
         match kind {
-            TelegramMediaKind::Video => {
-                self.telegram
-                    .send_video(chat_id, input, Some(caption), None)
-                    .await
-            }
+            TelegramMediaKind::Video => match video_metadata {
+                Some(metadata) => {
+                    self.telegram
+                        .send_video_reply_html_with_metadata(
+                            chat_id,
+                            input,
+                            Some(caption),
+                            reply_to_message_id,
+                            metadata,
+                            None,
+                        )
+                        .await
+                }
+                None => {
+                    self.telegram
+                        .send_video_reply_html(
+                            chat_id,
+                            input,
+                            Some(caption),
+                            reply_to_message_id,
+                            None,
+                        )
+                        .await
+                }
+            },
             TelegramMediaKind::Document => {
                 self.telegram
-                    .send_document(chat_id, input, Some(caption), None)
+                    .send_document_reply_html(
+                        chat_id,
+                        input,
+                        Some(caption),
+                        reply_to_message_id,
+                        None,
+                    )
                     .await
             }
         }
@@ -631,15 +677,82 @@ impl BotService {
 }
 
 fn format_post(post: &ResolvedPost) -> String {
-    let mut lines = Vec::new();
-    if let Some(author) = post.author.as_deref().filter(|value| !value.is_empty()) {
-        lines.push(format!("作者：{author}"));
-    }
-    lines.push(format!("内容：{}", post.display_title()));
     if post.original.is_some() {
-        lines.push("请选择下载版本：".into());
+        format!("{}\n\n请选择下载画质：", post.display_title())
     } else {
-        lines.push("上游没有提供独立的原视频候选。".into());
+        format!("{}\n\n该视频暂时只有普通画质可用。", post.display_title())
     }
-    lines.join("\n")
+}
+
+fn telegram_media_kind(codec: VideoCodec) -> TelegramMediaKind {
+    match codec {
+        VideoCodec::H264 | VideoCodec::H265 => TelegramMediaKind::Video,
+        VideoCodec::Unknown => TelegramMediaKind::Document,
+    }
+}
+
+fn telegram_video_metadata(probe: &MediaProbe) -> VideoMetadata {
+    let duration = probe.duration_seconds.and_then(|seconds| {
+        let rounded = seconds.ceil();
+        (rounded.is_finite() && rounded >= 0.0 && rounded <= f64::from(u32::MAX))
+            .then_some(rounded as u32)
+    });
+    VideoMetadata::new(probe.width, probe.height, duration)
+}
+
+fn format_caption(post: &ResolvedPost) -> String {
+    format_caption_parts(&post.display_title(), post.canonical_url.as_str())
+}
+
+fn format_caption_parts(title: &str, source: &str) -> String {
+    let title = escape_html(title);
+    let source = escape_html(source);
+    format!("{title}\n\n<blockquote><a href=\"{source}\">来源</a></blockquote>")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tries_h264_and_h265_as_previewable_videos() {
+        assert_eq!(
+            telegram_media_kind(VideoCodec::H264),
+            TelegramMediaKind::Video
+        );
+        assert_eq!(
+            telegram_media_kind(VideoCodec::H265),
+            TelegramMediaKind::Video
+        );
+        assert_eq!(
+            telegram_media_kind(VideoCodec::Unknown),
+            TelegramMediaKind::Document
+        );
+    }
+
+    #[test]
+    fn uses_visible_dimensions_and_rounded_duration_for_telegram() {
+        let probe = MediaProbe {
+            codec: VideoCodec::H265,
+            has_audio: true,
+            width: 1080,
+            height: 1920,
+            duration_seconds: Some(14.745),
+        };
+        assert_eq!(
+            telegram_video_metadata(&probe),
+            VideoMetadata::new(1080, 1920, Some(15))
+        );
+    }
+
+    #[test]
+    fn formats_a_safe_title_and_source_link() {
+        assert_eq!(
+            format_caption_parts(
+                "标题 <原画> & 测试",
+                "https://weixin.qq.com/sph/example?a=1&b=2"
+            ),
+            "标题 &lt;原画&gt; &amp; 测试\n\n<blockquote><a href=\"https://weixin.qq.com/sph/example?a=1&amp;b=2\">来源</a></blockquote>"
+        );
+    }
 }

@@ -15,8 +15,17 @@ use crate::{AppError, model::TelegramMediaKind};
 
 const GET_UPDATES_GRACE: Duration = Duration::from_secs(10);
 const MAX_API_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
+const HTML_PARSE_MODE: &str = "HTML";
 
 pub type TelegramResult<T> = std::result::Result<T, TelegramError>;
+
+#[derive(Default)]
+struct SendVideoOptions<'a> {
+    parse_mode: Option<&'a str>,
+    reply_parameters: Option<&'a ReplyParameters>,
+    metadata: Option<VideoMetadata>,
+    reply_markup: Option<&'a InlineKeyboardMarkup>,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum TelegramError {
@@ -180,11 +189,40 @@ impl TelegramClient {
         text: &str,
         reply_markup: Option<&InlineKeyboardMarkup>,
     ) -> TelegramResult<Message> {
+        self.send_message_inner(chat_id, text, None, reply_markup)
+            .await
+    }
+
+    /// Sends a message as a reply to another message in the same chat.
+    ///
+    /// Telegram keeps the reply relationship when this message is edited, so
+    /// callers can send a temporary "parsing" status and later replace it with
+    /// the download choices without losing the quoted source message.
+    pub async fn send_message_reply(
+        &self,
+        chat_id: i64,
+        text: &str,
+        reply_to_message_id: i64,
+        reply_markup: Option<&InlineKeyboardMarkup>,
+    ) -> TelegramResult<Message> {
+        let reply_parameters = ReplyParameters::new(reply_to_message_id);
+        self.send_message_inner(chat_id, text, Some(&reply_parameters), reply_markup)
+            .await
+    }
+
+    async fn send_message_inner(
+        &self,
+        chat_id: i64,
+        text: &str,
+        reply_parameters: Option<&ReplyParameters>,
+        reply_markup: Option<&InlineKeyboardMarkup>,
+    ) -> TelegramResult<Message> {
         self.call(
             "sendMessage",
             &SendMessageRequest {
                 chat_id,
                 text,
+                reply_parameters,
                 reply_markup,
             },
             None,
@@ -250,14 +288,109 @@ impl TelegramClient {
         caption: Option<&str>,
         reply_markup: Option<&InlineKeyboardMarkup>,
     ) -> TelegramResult<Message> {
+        self.send_video_inner(
+            chat_id,
+            video,
+            caption,
+            SendVideoOptions {
+                reply_markup,
+                ..SendVideoOptions::default()
+            },
+        )
+        .await
+    }
+
+    /// Sends a streamable video whose caption contains Telegram-supported HTML.
+    pub async fn send_video_html(
+        &self,
+        chat_id: i64,
+        video: &InputFile,
+        caption: Option<&str>,
+        reply_markup: Option<&InlineKeyboardMarkup>,
+    ) -> TelegramResult<Message> {
+        self.send_video_inner(
+            chat_id,
+            video,
+            caption,
+            SendVideoOptions {
+                parse_mode: Some(HTML_PARSE_MODE),
+                reply_markup,
+                ..SendVideoOptions::default()
+            },
+        )
+        .await
+    }
+
+    /// Sends an HTML-captioned streamable video as a reply in the same chat.
+    pub async fn send_video_reply_html(
+        &self,
+        chat_id: i64,
+        video: &InputFile,
+        caption: Option<&str>,
+        reply_to_message_id: i64,
+        reply_markup: Option<&InlineKeyboardMarkup>,
+    ) -> TelegramResult<Message> {
+        let reply_parameters = ReplyParameters::new(reply_to_message_id);
+        self.send_video_inner(
+            chat_id,
+            video,
+            caption,
+            SendVideoOptions {
+                parse_mode: Some(HTML_PARSE_MODE),
+                reply_parameters: Some(&reply_parameters),
+                reply_markup,
+                ..SendVideoOptions::default()
+            },
+        )
+        .await
+    }
+
+    /// Sends an HTML-captioned streamable video with explicit display metadata
+    /// as a reply in the same chat.
+    pub async fn send_video_reply_html_with_metadata(
+        &self,
+        chat_id: i64,
+        video: &InputFile,
+        caption: Option<&str>,
+        reply_to_message_id: i64,
+        metadata: VideoMetadata,
+        reply_markup: Option<&InlineKeyboardMarkup>,
+    ) -> TelegramResult<Message> {
+        let reply_parameters = ReplyParameters::new(reply_to_message_id);
+        self.send_video_inner(
+            chat_id,
+            video,
+            caption,
+            SendVideoOptions {
+                parse_mode: Some(HTML_PARSE_MODE),
+                reply_parameters: Some(&reply_parameters),
+                metadata: Some(metadata),
+                reply_markup,
+            },
+        )
+        .await
+    }
+
+    async fn send_video_inner(
+        &self,
+        chat_id: i64,
+        video: &InputFile,
+        caption: Option<&str>,
+        options: SendVideoOptions<'_>,
+    ) -> TelegramResult<Message> {
         self.call(
             "sendVideo",
             &SendVideoRequest {
                 chat_id,
                 video,
                 caption,
+                parse_mode: options.parse_mode,
                 supports_streaming: true,
-                reply_markup,
+                width: options.metadata.map(|value| value.width),
+                height: options.metadata.map(|value| value.height),
+                duration: options.metadata.and_then(|value| value.duration),
+                reply_parameters: options.reply_parameters,
+                reply_markup: options.reply_markup,
             },
             None,
         )
@@ -271,12 +404,67 @@ impl TelegramClient {
         caption: Option<&str>,
         reply_markup: Option<&InlineKeyboardMarkup>,
     ) -> TelegramResult<Message> {
+        self.send_document_inner(chat_id, document, caption, None, None, reply_markup)
+            .await
+    }
+
+    /// Sends a document whose caption contains Telegram-supported HTML.
+    pub async fn send_document_html(
+        &self,
+        chat_id: i64,
+        document: &InputFile,
+        caption: Option<&str>,
+        reply_markup: Option<&InlineKeyboardMarkup>,
+    ) -> TelegramResult<Message> {
+        self.send_document_inner(
+            chat_id,
+            document,
+            caption,
+            Some(HTML_PARSE_MODE),
+            None,
+            reply_markup,
+        )
+        .await
+    }
+
+    /// Sends an HTML-captioned document as a reply in the same chat.
+    pub async fn send_document_reply_html(
+        &self,
+        chat_id: i64,
+        document: &InputFile,
+        caption: Option<&str>,
+        reply_to_message_id: i64,
+        reply_markup: Option<&InlineKeyboardMarkup>,
+    ) -> TelegramResult<Message> {
+        let reply_parameters = ReplyParameters::new(reply_to_message_id);
+        self.send_document_inner(
+            chat_id,
+            document,
+            caption,
+            Some(HTML_PARSE_MODE),
+            Some(&reply_parameters),
+            reply_markup,
+        )
+        .await
+    }
+
+    async fn send_document_inner(
+        &self,
+        chat_id: i64,
+        document: &InputFile,
+        caption: Option<&str>,
+        parse_mode: Option<&str>,
+        reply_parameters: Option<&ReplyParameters>,
+        reply_markup: Option<&InlineKeyboardMarkup>,
+    ) -> TelegramResult<Message> {
         self.call(
             "sendDocument",
             &SendDocumentRequest {
                 chat_id,
                 document,
                 caption,
+                parse_mode,
+                reply_parameters,
                 reply_markup,
             },
             None,
@@ -477,6 +665,62 @@ impl Serialize for InputFile {
         S: Serializer,
     {
         serializer.serialize_str(&self.value)
+    }
+}
+
+/// Escapes untrusted text for Telegram's HTML parse mode.
+///
+/// The result is safe both as visible text and inside a double-quoted HTML
+/// attribute, which is useful when building a caption with an `<a href>` link.
+pub fn escape_html(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for character in value.chars() {
+        match character {
+            '&' => escaped.push_str("&amp;"),
+            '<' => escaped.push_str("&lt;"),
+            '>' => escaped.push_str("&gt;"),
+            '"' => escaped.push_str("&quot;"),
+            '\'' => escaped.push_str("&#39;"),
+            _ => escaped.push(character),
+        }
+    }
+    escaped
+}
+
+/// Display metadata passed explicitly to Telegram's `sendVideo` method.
+///
+/// Supplying the visible dimensions avoids Telegram inferring the coded width
+/// (for example 1088 instead of 1080) and rendering a portrait H.265 preview
+/// with the wrong aspect ratio.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VideoMetadata {
+    pub width: u32,
+    pub height: u32,
+    pub duration: Option<u32>,
+}
+
+impl VideoMetadata {
+    pub const fn new(width: u32, height: u32, duration: Option<u32>) -> Self {
+        Self {
+            width,
+            height,
+            duration,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct ReplyParameters {
+    pub message_id: i64,
+    pub allow_sending_without_reply: bool,
+}
+
+impl ReplyParameters {
+    pub const fn new(message_id: i64) -> Self {
+        Self {
+            message_id,
+            allow_sending_without_reply: true,
+        }
     }
 }
 
@@ -697,6 +941,8 @@ struct SendMessageRequest<'a> {
     chat_id: i64,
     text: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
+    reply_parameters: Option<&'a ReplyParameters>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     reply_markup: Option<&'a InlineKeyboardMarkup>,
 }
 
@@ -730,7 +976,17 @@ struct SendVideoRequest<'a> {
     video: &'a InputFile,
     #[serde(skip_serializing_if = "Option::is_none")]
     caption: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    parse_mode: Option<&'a str>,
     supports_streaming: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    width: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    height: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    duration: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reply_parameters: Option<&'a ReplyParameters>,
     #[serde(skip_serializing_if = "Option::is_none")]
     reply_markup: Option<&'a InlineKeyboardMarkup>,
 }
@@ -741,6 +997,10 @@ struct SendDocumentRequest<'a> {
     document: &'a InputFile,
     #[serde(skip_serializing_if = "Option::is_none")]
     caption: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    parse_mode: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reply_parameters: Option<&'a ReplyParameters>,
     #[serde(skip_serializing_if = "Option::is_none")]
     reply_markup: Option<&'a InlineKeyboardMarkup>,
 }
@@ -889,6 +1149,97 @@ mod tests {
                 "file:///tmp/video%20with%20spaces.mp4"
             );
         }
+    }
+
+    #[test]
+    fn serializes_reply_parameters_for_source_message() {
+        let reply_parameters = ReplyParameters::new(73);
+        let request = SendMessageRequest {
+            chat_id: 42,
+            text: "正在解析链接…",
+            reply_parameters: Some(&reply_parameters),
+            reply_markup: None,
+        };
+
+        let value = serde_json::to_value(request).unwrap();
+        assert_eq!(value["reply_parameters"]["message_id"], 73);
+        assert_eq!(
+            value["reply_parameters"]["allow_sending_without_reply"],
+            true
+        );
+        assert!(value.get("reply_to_message_id").is_none());
+        assert!(value.get("reply_markup").is_none());
+    }
+
+    #[test]
+    fn serializes_html_parse_mode_for_media_captions() {
+        let input = InputFile::file_id("cached-file-id").unwrap();
+        let reply_parameters = ReplyParameters::new(73);
+        let video = serde_json::to_value(SendVideoRequest {
+            chat_id: 42,
+            video: &input,
+            caption: Some("标题\n<a href=\"https://example.com\">来源</a>"),
+            parse_mode: Some(HTML_PARSE_MODE),
+            supports_streaming: true,
+            width: Some(1080),
+            height: Some(1920),
+            duration: Some(7),
+            reply_parameters: Some(&reply_parameters),
+            reply_markup: None,
+        })
+        .unwrap();
+        assert_eq!(video["parse_mode"], "HTML");
+        assert_eq!(video["supports_streaming"], true);
+        assert_eq!(video["width"], 1080);
+        assert_eq!(video["height"], 1920);
+        assert_eq!(video["duration"], 7);
+        assert_eq!(video["reply_parameters"]["message_id"], 73);
+
+        let document = serde_json::to_value(SendDocumentRequest {
+            chat_id: 42,
+            document: &input,
+            caption: Some("标题\n<a href=\"https://example.com\">来源</a>"),
+            parse_mode: Some(HTML_PARSE_MODE),
+            reply_parameters: Some(&reply_parameters),
+            reply_markup: None,
+        })
+        .unwrap();
+        assert_eq!(document["parse_mode"], "HTML");
+        assert_eq!(document["reply_parameters"]["message_id"], 73);
+    }
+
+    #[test]
+    fn omits_video_display_metadata_for_compatible_legacy_calls() {
+        let input = InputFile::file_id("cached-file-id").unwrap();
+        let video = serde_json::to_value(SendVideoRequest {
+            chat_id: 42,
+            video: &input,
+            caption: None,
+            parse_mode: None,
+            supports_streaming: true,
+            width: None,
+            height: None,
+            duration: None,
+            reply_parameters: None,
+            reply_markup: None,
+        })
+        .unwrap();
+
+        assert!(video.get("width").is_none());
+        assert!(video.get("height").is_none());
+        assert!(video.get("duration").is_none());
+    }
+
+    #[test]
+    fn escapes_untrusted_html_text_and_attributes() {
+        assert_eq!(
+            escape_html("A&B <标题> \"来源\" '视频号'"),
+            "A&amp;B &lt;标题&gt; &quot;来源&quot; &#39;视频号&#39;"
+        );
+        assert_eq!(
+            escape_html("https://example.com/?a=1&b=\"2\""),
+            "https://example.com/?a=1&amp;b=&quot;2&quot;"
+        );
     }
 
     #[test]
