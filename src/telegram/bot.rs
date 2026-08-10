@@ -1,11 +1,12 @@
 use std::{
     collections::{HashMap, VecDeque},
     panic::AssertUnwindSafe,
-    sync::{Arc, Mutex as StdMutex},
+    sync::{Arc, Mutex as StdMutex, OnceLock},
     time::Duration,
 };
 
 use futures_util::FutureExt;
+use regex::{Captures, Regex};
 use tokio::{
     sync::{Mutex, Semaphore, mpsc},
     task::AbortHandle,
@@ -35,6 +36,233 @@ const MAX_ACTIVE_TASKS: usize = 10;
 const MAX_WAITING_TASKS_PER_USER: usize = 3;
 const MAX_WAITING_TASKS: usize = 100;
 const MEDIA_PIPELINE_CONCURRENCY: usize = MAX_ACTIVE_TASKS;
+const INBOUND_LOG_PREVIEW_CHARS: usize = 240;
+
+fn log_inbound_update(update: &Update) {
+    if let Some(callback) = update.callback_query.as_ref() {
+        let message = callback.message.as_ref();
+        let callback_action = callback.data.as_deref().and_then(safe_callback_action);
+        let username = callback
+            .sender
+            .username
+            .as_deref()
+            .map(sanitize_inbound_log_preview);
+        info!(
+            event = "telegram_inbound",
+            update_kind = "callback_query",
+            user_id = callback.sender.id,
+            chat_id = ?message.map(|message| message.chat.id),
+            message_id = ?message.map(|message| message.message_id),
+            username = ?username.as_deref(),
+            callback_action = ?callback_action,
+            "收到 Telegram 回调"
+        );
+        return;
+    }
+
+    let Some(message) = update.message.as_ref() else {
+        info!(
+            event = "telegram_inbound",
+            update_kind = "unknown",
+            "收到无法识别的 Telegram update"
+        );
+        return;
+    };
+    let user_id = message.sender_id();
+    let username = message
+        .sender
+        .as_ref()
+        .and_then(|sender| sender.username.as_deref())
+        .map(sanitize_inbound_log_preview);
+
+    if let Some(text) = message.text.as_deref() {
+        let text = sanitize_inbound_log_preview(text);
+        info!(
+            event = "telegram_inbound",
+            update_kind = "message",
+            content_kind = "text",
+            user_id = ?user_id,
+            chat_id = message.chat.id,
+            message_id = message.message_id,
+            username = ?username.as_deref(),
+            text = %text,
+            "收到 Telegram 文本消息"
+        );
+        return;
+    }
+
+    let (content_kind, mime_type, file_size) = if let Some(video) = message.video.as_ref() {
+        ("video", video.mime_type.as_deref(), video.file_size)
+    } else if let Some(document) = message.document.as_ref() {
+        (
+            "document",
+            document.mime_type.as_deref(),
+            document.file_size,
+        )
+    } else {
+        ("other", None, None)
+    };
+    let mime_type = mime_type.map(sanitize_inbound_log_preview);
+    let caption = message.caption.as_deref().map(sanitize_inbound_log_preview);
+    info!(
+        event = "telegram_inbound",
+        update_kind = "message",
+        content_kind,
+        user_id = ?user_id,
+        chat_id = message.chat.id,
+        message_id = message.message_id,
+        username = ?username.as_deref(),
+        mime_type = ?mime_type.as_deref(),
+        file_size = ?file_size,
+        caption = ?caption.as_deref(),
+        "收到 Telegram 非文本消息"
+    );
+}
+
+fn sanitize_inbound_log_preview(value: &str) -> String {
+    static BOT_TOKEN_PATTERN: OnceLock<Regex> = OnceLock::new();
+    static LINE_SECRET_PATTERN: OnceLock<Regex> = OnceLock::new();
+    static TOKEN_ASSIGNMENT_PATTERN: OnceLock<Regex> = OnceLock::new();
+    static BEARER_PATTERN: OnceLock<Regex> = OnceLock::new();
+    static URL_PATTERN: OnceLock<Regex> = OnceLock::new();
+    static OPAQUE_ID_PATTERN: OnceLock<Regex> = OnceLock::new();
+
+    let bot_token_pattern = BOT_TOKEN_PATTERN.get_or_init(|| {
+        Regex::new(r"\d{5,}:[A-Za-z0-9_-]{20,}")
+            .expect("the Telegram Bot Token regex is a constant")
+    });
+    let line_secret_pattern = LINE_SECRET_PATTERN.get_or_init(|| {
+        Regex::new(
+            r"(?im)\b([a-z0-9_-]*(?:authorization|cookie|password|passwd))\s*([:=])\s*[^\r\n]*",
+        )
+        .expect("the line secret regex is a constant")
+    });
+    let token_assignment_pattern = TOKEN_ASSIGNMENT_PATTERN.get_or_init(|| {
+        Regex::new(
+            r#"(?i)\b([a-z0-9_-]*(?:bot[_-]?token|access[_-]?token|token|api[_-]?(?:hash|key)))\s*([:=])\s*(?:"[^"\r\n]*"|'[^'\r\n]*'|[^\s,;]+)"#,
+        )
+        .expect("the token assignment regex is a constant")
+    });
+    let bearer_pattern = BEARER_PATTERN.get_or_init(|| {
+        Regex::new(r"(?i)\b(bearer)\s+[^\s,;]+").expect("the bearer credential regex is a constant")
+    });
+    let url_pattern = URL_PATTERN.get_or_init(|| {
+        Regex::new(r#"(?i)\b(?:https?|tg)://[^\s<>"']+"#)
+            .expect("the inbound URL regex is a constant")
+    });
+    let opaque_id_pattern = OPAQUE_ID_PATTERN.get_or_init(|| {
+        Regex::new(r"\b[A-Za-z0-9_-]{64,}\b").expect("the opaque identifier regex is a constant")
+    });
+
+    let safe_value = value
+        .chars()
+        .filter(|character| !is_unsafe_log_format_control(*character))
+        .map(|character| {
+            if character.is_control() && !matches!(character, '\r' | '\n') {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect::<String>();
+
+    // Redact URL suffixes before inserting angle-bracket placeholders; those
+    // placeholders deliberately terminate the URL matcher.
+    let redacted = url_pattern.replace_all(&safe_value, |captures: &Captures<'_>| {
+        sanitize_inbound_url(&captures[0])
+    });
+    let redacted = bot_token_pattern.replace_all(&redacted, "<redacted-bot-token>");
+    let redacted = line_secret_pattern.replace_all(&redacted, "$1$2<redacted>");
+    let redacted = token_assignment_pattern.replace_all(&redacted, "$1$2<redacted>");
+    let redacted = bearer_pattern.replace_all(&redacted, "$1 <redacted>");
+    let redacted = opaque_id_pattern.replace_all(&redacted, "<redacted-id>");
+
+    let mut single_line = String::with_capacity(redacted.len().min(INBOUND_LOG_PREVIEW_CHARS));
+    let mut pending_space = false;
+    for character in redacted.chars() {
+        if character.is_whitespace() || character.is_control() {
+            pending_space = !single_line.is_empty();
+            continue;
+        }
+        if pending_space {
+            single_line.push(' ');
+            pending_space = false;
+        }
+        single_line.push(character);
+    }
+
+    if single_line.chars().count() <= INBOUND_LOG_PREVIEW_CHARS {
+        return single_line;
+    }
+    let mut preview = single_line
+        .chars()
+        .take(INBOUND_LOG_PREVIEW_CHARS - 1)
+        .collect::<String>();
+    preview.push('…');
+    preview
+}
+
+fn is_unsafe_log_format_control(character: char) -> bool {
+    matches!(
+        character,
+        '\u{061c}'
+            | '\u{200b}'..='\u{200f}'
+            | '\u{202a}'..='\u{202e}'
+            | '\u{2060}'..='\u{206f}'
+            | '\u{feff}'
+    )
+}
+
+fn sanitize_inbound_url(value: &str) -> String {
+    let Ok(mut url) = url::Url::parse(value) else {
+        let secret_start = value.find(['?', '#']);
+        return secret_start.map_or_else(
+            || "<redacted-url>".to_owned(),
+            |index| format!("{}?<redacted>", &value[..index]),
+        );
+    };
+    let had_credentials = !url.username().is_empty() || url.password().is_some();
+    let had_query = url.query().is_some();
+    let had_fragment = url.fragment().is_some();
+    if !had_credentials && !had_query && !had_fragment {
+        return value.to_owned();
+    }
+
+    if had_credentials {
+        let _ = url.set_username("");
+        let _ = url.set_password(None);
+    }
+    url.set_query(None);
+    url.set_fragment(None);
+    let mut sanitized = url.to_string();
+    if had_query || had_fragment {
+        sanitized.push_str("?<redacted>");
+    }
+    sanitized
+}
+
+fn safe_callback_action(data: &str) -> Option<&'static str> {
+    let mut parts = data.split('|');
+    if parts.next()? != "setting" || parts.next()?.parse::<u64>().is_err() {
+        return None;
+    }
+    let action = parts.next()?;
+    let argument = parts.next();
+    if parts.next().is_some() {
+        return None;
+    }
+    match (action, argument) {
+        ("main", None) => Some("main"),
+        ("done", None) => Some("done"),
+        ("language", None) => Some("language"),
+        ("source", None) => Some("source"),
+        ("progress", None) => Some("progress"),
+        ("reply", None) => Some("reply"),
+        ("cover", None) => Some("cover"),
+        ("lang", Some(code)) if Language::from_code(code).is_some() => Some("lang"),
+        _ => None,
+    }
+}
 
 #[derive(Clone)]
 pub struct BotService {
@@ -451,6 +679,7 @@ impl BotService {
     }
 
     async fn handle_update(&self, update: Update, shutdown: &CancellationToken) -> Result<()> {
+        log_inbound_update(&update);
         if let Some(callback) = update.callback_query {
             return self.handle_callback(callback, shutdown).await;
         }
@@ -1681,6 +1910,83 @@ mod tests {
         assert_eq!(command_name("/setting"), Some("setting"));
         assert_ne!(command_name("/unknown"), Some("start"));
         assert_eq!(command_name("https://weixin.qq.com/sph/example"), None);
+    }
+
+    #[test]
+    fn sanitizes_sensitive_inbound_log_text_into_one_line() {
+        let bot_token = "123456789:abcdefghijklmnopqrstuvwxyz_1234567890";
+        let opaque_id = "A".repeat(80);
+        let preview = sanitize_inbound_log_preview(&format!(
+            "第一\u{202e}行\n第二行 https://alice:secret@example.test/watch?ticket=private#fragment \
+             TELEGRAM_BOT_TOKEN='{bot_token}' id={opaque_id}"
+        ));
+
+        assert!(preview.starts_with("第一行 第二行 "));
+        assert!(preview.contains("https://example.test/watch?<redacted>"));
+        assert!(preview.contains("TELEGRAM_BOT_TOKEN=<redacted>"));
+        assert!(preview.contains("id=<redacted-id>"));
+        assert!(!preview.contains("alice"));
+        assert!(!preview.contains("secret"));
+        assert!(!preview.contains("ticket"));
+        assert!(!preview.contains(bot_token));
+        assert!(!preview.contains(&opaque_id));
+        assert!(!preview.chars().any(char::is_control));
+        assert!(!preview.contains('\u{202e}'));
+    }
+
+    #[test]
+    fn redacts_token_bearer_and_whole_line_credentials() {
+        let preview = sanitize_inbound_log_preview(
+            "ACCESS_TOKEN=private-token Bearer private-bearer\n\
+             Cookie=session=private; user=42 still-private\n\
+             password: correct horse battery staple\nvisible",
+        );
+
+        assert_eq!(
+            preview,
+            "ACCESS_TOKEN=<redacted> Bearer <redacted> Cookie=<redacted> password:<redacted> visible"
+        );
+        assert!(!preview.contains("private"));
+        assert!(!preview.contains("session"));
+        assert!(!preview.contains("correct horse"));
+    }
+
+    #[test]
+    fn redacts_queries_after_bot_tokens_inside_urls() {
+        let bot_token = "123456789:abcdefghijklmnopqrstuvwxyz_1234567890";
+        let preview = sanitize_inbound_log_preview(&format!(
+            "https://api.telegram.org/bot{bot_token}/sendMessage?chat_id=private#fragment"
+        ));
+
+        assert!(preview.contains("<redacted-bot-token>"));
+        assert!(preview.ends_with("?<redacted>"));
+        assert!(!preview.contains(bot_token));
+        assert!(!preview.contains("chat_id"));
+        assert!(!preview.contains("private"));
+    }
+
+    #[test]
+    fn truncates_inbound_log_text_on_unicode_character_boundaries() {
+        let preview = sanitize_inbound_log_preview(&"界".repeat(300));
+
+        assert_eq!(preview.chars().count(), INBOUND_LOG_PREVIEW_CHARS);
+        assert!(preview.ends_with('…'));
+        assert_eq!(
+            preview
+                .chars()
+                .filter(|character| *character == '界')
+                .count(),
+            239
+        );
+    }
+
+    #[test]
+    fn exposes_only_allowlisted_callback_actions() {
+        assert_eq!(safe_callback_action("setting|42|source"), Some("source"));
+        assert_eq!(safe_callback_action("setting|42|lang|en"), Some("lang"));
+        assert_eq!(safe_callback_action("setting|42|lang|invalid"), None);
+        assert_eq!(safe_callback_action("setting|42|source|private"), None);
+        assert_eq!(safe_callback_action("secret|42|token"), None);
     }
 
     #[test]
