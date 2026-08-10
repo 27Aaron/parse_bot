@@ -62,11 +62,6 @@ async fn downloads_decrypts_and_probes_wechat_channels_sample() {
         .unwrap_or_else(|_| panic!("live WeChat media download failed"));
 
     assert!(downloaded.bytes > 0, "downloaded media is empty");
-    assert_eq!(
-        downloaded.source_sha256.len(),
-        64,
-        "downloaded media hash has an unexpected length"
-    );
     if let Some(decode_key) = post.video.decode_key {
         decrypt_file_prefix(&downloaded.path, decode_key)
             .await

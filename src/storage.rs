@@ -211,11 +211,6 @@ impl MediaCache {
         Ok(())
     }
 
-    pub async fn get_user_settings(&self, user_id: u64) -> Result<UserSettings> {
-        self.get_user_settings_with_default(user_id, Language::Chinese)
-            .await
-    }
-
     pub async fn get_user_settings_with_default(
         &self,
         user_id: u64,
@@ -648,7 +643,10 @@ mod tests {
         };
 
         assert_eq!(
-            cache.get_user_settings(42).await.unwrap(),
+            cache
+                .get_user_settings_with_default(42, Language::Chinese)
+                .await
+                .unwrap(),
             UserSettings::default()
         );
         assert_eq!(
@@ -667,7 +665,13 @@ mod tests {
             show_video_cover: true,
         };
         cache.put_user_settings(42, settings).await.unwrap();
-        assert_eq!(cache.get_user_settings(42).await.unwrap(), settings);
+        assert_eq!(
+            cache
+                .get_user_settings_with_default(42, Language::Chinese)
+                .await
+                .unwrap(),
+            settings
+        );
     }
 
     #[test]

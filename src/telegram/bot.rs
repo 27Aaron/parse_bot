@@ -1580,11 +1580,6 @@ fn format_caption_parts(
     )
 }
 
-#[cfg(test)]
-fn format_help_text(required_channel_id: Option<&str>) -> String {
-    i18n::start_text(Language::Chinese, required_channel_id)
-}
-
 fn format_channel_requirement(language: Language, channel_id: &str) -> String {
     let username = channel_id.trim_start_matches('@');
     i18n::channel_requirement(language, channel_id, &format!("https://t.me/{username}"))
@@ -1885,12 +1880,12 @@ mod tests {
 
     #[test]
     fn mentions_the_required_channel_only_when_configured() {
-        let public_help = format_help_text(None);
+        let public_help = i18n::start_text(Language::Chinese, None);
         assert!(!public_help.contains("关注频道"));
         assert!(!public_help.contains("2000 MB"));
         assert!(!public_help.contains("telegram-bot-api"));
 
-        let gated_help = format_help_text(Some("@Aaron_Channels"));
+        let gated_help = i18n::start_text(Language::Chinese, Some("@Aaron_Channels"));
         assert!(gated_help.contains("使用前需要关注频道 @Aaron_Channels。"));
     }
 

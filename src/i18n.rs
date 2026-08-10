@@ -246,15 +246,6 @@ pub fn channel_check_failed(language: Language) -> &'static str {
     }
 }
 
-pub fn settings_title(language: Language) -> &'static str {
-    match language {
-        Language::Chinese => "设置",
-        Language::English => "Settings",
-        Language::Japanese => "設定",
-        Language::Russian => "Настройки",
-    }
-}
-
 pub fn settings_panel_title(language: Language) -> &'static str {
     match language {
         Language::Chinese => "▎配置面板 - 个人配置",

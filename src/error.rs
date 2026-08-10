@@ -46,9 +46,6 @@ pub enum AppError {
     #[error("任务已过期，请重新发送链接")]
     Expired,
 
-    #[error("没有权限执行这个操作")]
-    Forbidden,
-
     #[error("任务已取消")]
     Cancelled,
 
@@ -66,32 +63,7 @@ pub enum AppError {
 }
 
 impl AppError {
-    pub fn user_message(&self) -> &'static str {
-        match self {
-            Self::Config(_) => "服务配置错误，请检查日志",
-            Self::UnsupportedUrl => "暂不支持这个链接",
-            Self::LoginRequired => "解析凭据已失效，请更新元宝 Cookie",
-            Self::NotFound => "内容不存在、已删除或不可见",
-            Self::MediaUnavailable => "该视频暂时无法取得可用视频，请稍后重试",
-            Self::UpstreamChanged => "微信接口可能已经变化，请稍后更新程序",
-            Self::RateLimited => "请求过于频繁，请稍后再试",
-            Self::Network(_) | Self::Download(_) => "下载失败，请稍后重试",
-            Self::InvalidMedia(_) => "下载到的内容不是有效视频",
-            Self::MediaTooLarge { .. } => "文件超过当前允许的大小上限",
-            Self::Storage(_) => "临时存储不可用",
-            Self::Telegram(_) => "Telegram 上传失败，请稍后重试",
-            Self::Expired => "操作已经过期，请重新发送链接",
-            Self::Forbidden => "没有权限执行这个操作",
-            Self::Cancelled => "任务已取消",
-            Self::Database(_) | Self::Io(_) | Self::Json(_) | Self::Url(_) => {
-                "处理失败，请稍后重试"
-            }
-        }
-    }
-
-    /// Returns the short, safe message shown to a user in the selected
-    /// language.  The existing `user_message` method remains as a Chinese
-    /// compatibility helper for callers that do not have a user preference.
+    /// Returns the short, safe message shown to a user in the selected language.
     pub fn localized_message(&self, language: Language) -> String {
         match (language, self) {
             (_, Self::Config(_)) => match language {
@@ -202,12 +174,6 @@ impl AppError {
                     "タスクの有効期限が切れました。リンクをもう一度送信してください。".into()
                 }
                 Language::Russian => "Срок действия задачи истёк. Отправьте ссылку ещё раз.".into(),
-            },
-            (_, Self::Forbidden) => match language {
-                Language::Chinese => "没有权限执行这个操作".into(),
-                Language::English => "You are not allowed to perform this action.".into(),
-                Language::Japanese => "この操作を実行する権限がありません。".into(),
-                Language::Russian => "У вас нет прав для этого действия.".into(),
             },
             (_, Self::Cancelled) => match language {
                 Language::Chinese => "任务已取消".into(),
