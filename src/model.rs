@@ -21,19 +21,19 @@ pub enum VideoCodec {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum MediaProvenance {
+pub enum MediaSourceKind {
     H264,
     H265,
     Generic,
-    ExplicitOrigin,
-    DerivedOriginal,
+    Direct,
+    Derived,
 }
 
 #[derive(Clone)]
 pub struct MediaSource {
     pub url: Url,
     pub codec: VideoCodec,
-    pub provenance: MediaProvenance,
+    pub provenance: MediaSourceKind,
     pub width: Option<u32>,
     pub height: Option<u32>,
     pub size_hint: Option<u64>,

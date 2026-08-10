@@ -14,8 +14,8 @@ pub enum AppError {
     #[error("内容不存在、已删除或不可见")]
     NotFound,
 
-    #[error("该视频暂时无法取得原画地址")]
-    OriginalUnavailable,
+    #[error("该视频暂时无法取得可用媒体地址")]
+    MediaUnavailable,
 
     #[error("微信接口结构可能已经变化")]
     UpstreamChanged,
@@ -70,7 +70,7 @@ impl AppError {
             Self::UnsupportedUrl => "暂不支持这个链接",
             Self::LoginRequired => "解析凭据已失效，请更新元宝 Cookie",
             Self::NotFound => "内容不存在、已删除或不可见",
-            Self::OriginalUnavailable => "该视频暂时无法取得原画，请稍后重试",
+            Self::MediaUnavailable => "该视频暂时无法取得可用视频，请稍后重试",
             Self::UpstreamChanged => "微信接口可能已经变化，请稍后更新程序",
             Self::RateLimited => "请求过于频繁，请稍后再试",
             Self::Network(_) | Self::Download(_) => "下载失败，请稍后重试",

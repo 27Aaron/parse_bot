@@ -15,7 +15,7 @@ use uuid::Uuid;
 
 use crate::{
     AppError, Result,
-    model::{MediaProvenance, MediaSource, REVIEWED_WECHAT_MEDIA_HOSTS, ResolvedPost, VideoCodec},
+    model::{MediaSource, MediaSourceKind, REVIEWED_WECHAT_MEDIA_HOSTS, ResolvedPost, VideoCodec},
 };
 
 const PARSE_ENDPOINT: &str = "https://yuanbao.tencent.com/api/weixin/get_parse_result";
@@ -274,7 +274,8 @@ struct NormalizedShareUrl {
 pub fn extract_share_url(input: &str) -> Result<Url> {
     static URL_PATTERN: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
     let pattern = URL_PATTERN.get_or_init(|| {
-        Regex::new(r#"https?://[^\s<>\"']+"#).expect("constant URL regex must compile")
+        Regex::new(r#"https://weixin\.qq\.com/sph/[^\s<>\"']+"#)
+            .expect("constant URL regex must compile")
     });
 
     for matched in pattern.find_iter(input) {
@@ -296,6 +297,7 @@ fn normalize_share_url(url: &Url) -> Result<NormalizedShareUrl> {
         || !url.username().is_empty()
         || url.password().is_some()
         || url.port().is_some()
+        || url.query().is_some()
         || url.fragment().is_some()
     {
         return Err(AppError::UnsupportedUrl);
@@ -307,24 +309,15 @@ fn normalize_share_url(url: &Url) -> Result<NormalizedShareUrl> {
     }
     let host = host.to_ascii_lowercase();
 
-    let share_id = match host.as_str() {
-        "weixin.qq.com" => {
-            let segments = url
-                .path_segments()
-                .ok_or(AppError::UnsupportedUrl)?
-                .filter(|segment| !segment.is_empty())
-                .collect::<Vec<_>>();
-            if segments.len() != 2 || segments[0] != "sph" {
-                return Err(AppError::UnsupportedUrl);
-            }
-            segments[1].to_owned()
-        }
-        "channels.weixin.qq.com" if url.path() == "/finder-preview/pages/sph" => url
-            .query_pairs()
-            .find_map(|(key, value)| (key == "id").then(|| value.into_owned()))
-            .ok_or(AppError::UnsupportedUrl)?,
-        _ => return Err(AppError::UnsupportedUrl),
-    };
+    if host != "weixin.qq.com" {
+        return Err(AppError::UnsupportedUrl);
+    }
+    let share_id = url
+        .path()
+        .strip_prefix("/sph/")
+        .filter(|value| !value.is_empty() && !value.contains('/'))
+        .ok_or(AppError::UnsupportedUrl)?
+        .to_owned();
 
     if !(6..=128).contains(&share_id.len())
         || !share_id
@@ -342,28 +335,22 @@ fn normalize_share_url(url: &Url) -> Result<NormalizedShareUrl> {
     })
 }
 
-pub fn derive_original_url(source: &Url) -> Option<Url> {
-    if source.scheme() != "https"
-        || source.host_str()? != "finder.video.qq.com"
-        || !source.username().is_empty()
-        || source.password().is_some()
-        || source.port().is_some()
-        || source.fragment().is_some()
-    {
+pub fn derive_direct_media_url(source: &Url) -> Option<Url> {
+    if !is_allowed_media_url(source) {
         return None;
     }
 
     let file_key = query_value(source, "encfilekey")?;
     let token = query_value(source, "token")?;
-    let mut original = source.clone();
-    original.set_query(None);
-    original.set_fragment(None);
-    original
+    let mut direct = source.clone();
+    direct.set_query(None);
+    direct.set_fragment(None);
+    direct
         .query_pairs_mut()
         .append_pair("encfilekey", &file_key)
         .append_pair("token", &token);
 
-    Some(original)
+    Some(direct)
 }
 
 fn build_post(
@@ -392,60 +379,59 @@ fn build_post(
     push_candidate(
         &mut candidates,
         feed_info.get("h264VideoInfo"),
-        MediaProvenance::H264,
+        MediaSourceKind::H264,
         VideoCodec::H264,
-    );
-    push_direct_candidate(
-        &mut candidates,
-        feed_info,
-        "videoUrl",
-        MediaProvenance::Generic,
-        VideoCodec::Unknown,
     );
     push_candidate(
         &mut candidates,
         feed_info.get("h265VideoInfo"),
-        MediaProvenance::H265,
+        MediaSourceKind::H265,
         VideoCodec::H265,
     );
-    push_direct_candidate(
+    push_source(
         &mut candidates,
         feed_info,
-        "originVideoUrl",
-        MediaProvenance::ExplicitOrigin,
+        "videoUrl",
+        MediaSourceKind::Generic,
         VideoCodec::Unknown,
     );
 
-    let explicit_original = candidates
-        .iter()
-        .find(|source| source.provenance == MediaProvenance::ExplicitOrigin)
-        .cloned();
-    let video = if let Some(explicit_original) = explicit_original {
-        explicit_original
+    let direct_source = parse_source(
+        feed_info,
+        "originVideoUrl",
+        MediaSourceKind::Direct,
+        VideoCodec::Unknown,
+    )
+    .map(|mut direct| {
+        if let Some(candidate) = matching_candidate(&direct, &candidates) {
+            let same_url = direct.url == candidate.url;
+            merge_source_metadata(&mut direct, candidate, same_url);
+        }
+        direct
+    });
+
+    let video = if let Some(direct_source) = direct_source {
+        direct_source
     } else {
         [
-            MediaProvenance::H264,
-            MediaProvenance::H265,
-            MediaProvenance::Generic,
+            MediaSourceKind::H264,
+            MediaSourceKind::H265,
+            MediaSourceKind::Generic,
         ]
         .into_iter()
-        .filter_map(|provenance| {
-            candidates
-                .iter()
-                .find(|source| source.provenance == provenance)
-        })
+        .filter_map(|kind| candidates.iter().find(|source| source.provenance == kind))
         .find_map(|candidate| {
-            derive_original_url(&candidate.url).map(|url| MediaSource {
+            derive_direct_media_url(&candidate.url).map(|url| MediaSource {
                 url,
                 codec: candidate.codec,
-                provenance: MediaProvenance::DerivedOriginal,
+                provenance: MediaSourceKind::Derived,
                 width: candidate.width,
                 height: candidate.height,
                 size_hint: None,
                 decode_key: candidate.decode_key,
             })
         })
-        .ok_or(AppError::OriginalUnavailable)?
+        .ok_or(AppError::MediaUnavailable)?
     };
 
     let description = text_at(feed_info, "description").or_else(|| non_empty(parse_data.desc));
@@ -478,41 +464,127 @@ fn build_post(
 fn push_candidate(
     output: &mut Vec<MediaSource>,
     value: Option<&Value>,
-    provenance: MediaProvenance,
+    kind: MediaSourceKind,
     codec: VideoCodec,
 ) {
     let Some(value) = value else { return };
-    push_direct_candidate(output, value, "videoUrl", provenance, codec);
+    push_source(output, value, "videoUrl", kind, codec);
 }
 
-fn push_direct_candidate(
+fn push_source(
     output: &mut Vec<MediaSource>,
     value: &Value,
     url_field: &str,
-    provenance: MediaProvenance,
+    kind: MediaSourceKind,
     codec: VideoCodec,
 ) {
-    let Some(raw_url) = text_at(value, url_field) else {
+    let Some(source) = parse_source(value, url_field, kind, codec) else {
         return;
     };
-    let Ok(url) = Url::parse(&raw_url) else {
-        return;
-    };
-    if !is_allowed_media_url(&url) || output.iter().any(|source| source.url == url) {
-        return;
+    if let Some(existing) = output
+        .iter_mut()
+        .find(|existing| existing.url == source.url)
+    {
+        merge_source_metadata(existing, &source, true);
+    } else {
+        output.push(source);
+    }
+}
+
+fn parse_source(
+    value: &Value,
+    url_field: &str,
+    kind: MediaSourceKind,
+    codec: VideoCodec,
+) -> Option<MediaSource> {
+    let raw_url = text_at(value, url_field)?;
+    let url = Url::parse(&raw_url).ok()?;
+    if !is_allowed_media_url(&url) {
+        return None;
     }
 
-    output.push(MediaSource {
+    Some(MediaSource {
         url,
         codec,
-        provenance,
+        provenance: kind,
         width: number_at(value, "width").and_then(|value| u32::try_from(value).ok()),
         height: number_at(value, "height").and_then(|value| u32::try_from(value).ok()),
         size_hint: number_at(value, "fileSize"),
         decode_key: text_at(value, "decodeKey")
             .and_then(|value| value.parse::<u64>().ok())
             .or_else(|| number_at(value, "decodeKey")),
-    });
+    })
+}
+
+fn matching_candidate<'a>(
+    direct: &MediaSource,
+    candidates: &'a [MediaSource],
+) -> Option<&'a MediaSource> {
+    candidates
+        .iter()
+        .find(|candidate| candidate.url == direct.url)
+        .or_else(|| {
+            let direct_url = derive_direct_media_url(&direct.url)?;
+            candidates.iter().find(|candidate| {
+                derive_direct_media_url(&candidate.url).as_ref() == Some(&direct_url)
+            })
+        })
+        .or_else(|| {
+            candidates
+                .iter()
+                .find(|candidate| has_matching_media_identity(&direct.url, &candidate.url))
+        })
+}
+
+fn has_matching_media_identity(left: &Url, right: &Url) -> bool {
+    if left.scheme() != right.scheme()
+        || left.host_str() != right.host_str()
+        || left.port_or_known_default() != right.port_or_known_default()
+        || left.path() != right.path()
+    {
+        return false;
+    }
+
+    let left_file_key = query_value(left, "encfilekey");
+    let right_file_key = query_value(right, "encfilekey");
+    let left_token = query_value(left, "token");
+    let right_token = query_value(right, "token");
+    let file_key_matches = matches!(
+        (&left_file_key, &right_file_key),
+        (Some(left), Some(right)) if left == right
+    );
+    let token_matches = matches!(
+        (&left_token, &right_token),
+        (Some(left), Some(right)) if left == right
+    );
+    let file_key_conflicts = matches!(
+        (&left_file_key, &right_file_key),
+        (Some(left), Some(right)) if left != right
+    );
+    let token_conflicts = matches!(
+        (&left_token, &right_token),
+        (Some(left), Some(right)) if left != right
+    );
+
+    !file_key_conflicts && !token_conflicts && (file_key_matches || token_matches)
+}
+
+fn merge_source_metadata(target: &mut MediaSource, source: &MediaSource, inherit_size_hint: bool) {
+    if target.codec == VideoCodec::Unknown {
+        target.codec = source.codec;
+    }
+    if target.width.is_none() {
+        target.width = source.width;
+    }
+    if target.height.is_none() {
+        target.height = source.height;
+    }
+    if target.decode_key.is_none() {
+        target.decode_key = source.decode_key;
+    }
+    if inherit_size_hint && target.size_hint.is_none() {
+        target.size_hint = source.size_hint;
+    }
 }
 
 fn is_allowed_media_url(url: &Url) -> bool {
@@ -678,15 +750,18 @@ mod tests {
     }
 
     #[test]
-    fn supports_strict_preview_url() {
-        let input =
-            Url::parse("https://channels.weixin.qq.com/finder-preview/pages/sph?id=A27pGwf5f9")
-                .unwrap();
-        let normalized = normalize_share_url(&input).unwrap();
-        assert_eq!(
-            normalized.canonical_url.as_str(),
-            "https://weixin.qq.com/sph/A27pGwf5f9"
-        );
+    fn rejects_preview_and_other_link_forms_during_extraction() {
+        for input in [
+            "https://channels.weixin.qq.com/finder-preview/pages/sph?id=A27pGwf5f9",
+            "http://weixin.qq.com/sph/A27pGwf5f9",
+            "https://WEIXIN.QQ.COM/sph/A27pGwf5f9",
+            "https://weixin.qq.com/other/A27pGwf5f9",
+        ] {
+            assert!(matches!(
+                extract_share_url(input),
+                Err(AppError::UnsupportedUrl)
+            ));
+        }
     }
 
     #[test]
@@ -697,6 +772,9 @@ mod tests {
             "https://weixin.qq.com./sph/A27pGwf5f9",
             "https://user@weixin.qq.com/sph/A27pGwf5f9",
             "https://weixin.qq.com/other/A27pGwf5f9",
+            "https://weixin.qq.com/sph/A27pGwf5f9/",
+            "https://weixin.qq.com/sph/A27pGwf5f9?from=share",
+            "https://weixin.qq.com/sph/A27pGwf5f9#fragment",
         ] {
             assert!(
                 normalize_share_url(&Url::parse(raw).unwrap()).is_err(),
@@ -706,35 +784,79 @@ mod tests {
     }
 
     #[test]
-    fn derives_original_url_structurally() {
+    fn derives_direct_media_url_structurally() {
         let source = Url::parse(
             "https://finder.video.qq.com/path/video.mp4?token=t%2Bv&quality=hd&encfilekey=e%26k",
         )
         .unwrap();
-        let original = derive_original_url(&source).unwrap();
+        let direct = derive_direct_media_url(&source).unwrap();
         assert_eq!(
-            original.as_str(),
+            direct.as_str(),
             "https://finder.video.qq.com/path/video.mp4?encfilekey=e%26k&token=t%2Bv"
         );
     }
 
     #[test]
-    fn normalizes_clean_original_and_rejects_incomplete_urls() {
+    fn derives_direct_media_urls_for_every_reviewed_host() {
+        for host in REVIEWED_WECHAT_MEDIA_HOSTS {
+            let source = Url::parse(&format!(
+                "https://{host}/video.mp4?token=token&quality=hd&encfilekey=key"
+            ))
+            .unwrap();
+            let direct = derive_direct_media_url(&source).unwrap();
+            assert_eq!(direct.host_str(), Some(*host));
+            assert_eq!(direct.query(), Some("encfilekey=key&token=token"));
+        }
+    }
+
+    #[test]
+    fn normalizes_clean_direct_url_and_rejects_incomplete_urls() {
         let already_clean =
             Url::parse("https://finder.video.qq.com/video.mp4?encfilekey=key&token=token").unwrap();
         let missing = Url::parse("https://finder.video.qq.com/video.mp4?token=token").unwrap();
         let reverse_order =
             Url::parse("https://finder.video.qq.com/video.mp4?token=token&encfilekey=key").unwrap();
-        assert_eq!(derive_original_url(&already_clean).unwrap(), already_clean);
-        assert!(derive_original_url(&missing).is_none());
         assert_eq!(
-            derive_original_url(&reverse_order).unwrap().query(),
+            derive_direct_media_url(&already_clean).unwrap(),
+            already_clean
+        );
+        assert!(derive_direct_media_url(&missing).is_none());
+        assert_eq!(
+            derive_direct_media_url(&reverse_order).unwrap().query(),
             Some("encfilekey=key&token=token")
         );
         let dotted =
             Url::parse("https://finder.video.qq.com./video.mp4?encfilekey=key&token=token")
                 .unwrap();
-        assert!(derive_original_url(&dotted).is_none());
+        assert!(derive_direct_media_url(&dotted).is_none());
+    }
+
+    #[test]
+    fn matches_media_identity_only_when_path_and_signed_values_are_compatible() {
+        let direct =
+            Url::parse("https://finder.video.qq.com/shared.mp4?token=shared-token").unwrap();
+        let candidate =
+            Url::parse("https://finder.video.qq.com/shared.mp4?token=shared-token&encfilekey=key")
+                .unwrap();
+        assert!(has_matching_media_identity(&direct, &candidate));
+
+        let conflicting_token =
+            Url::parse("https://finder.video.qq.com/shared.mp4?token=other-token").unwrap();
+        let conflicting_key = Url::parse(
+            "https://finder.video.qq.com/shared.mp4?token=shared-token&encfilekey=other-key",
+        )
+        .unwrap();
+        let keyed_direct =
+            Url::parse("https://finder.video.qq.com/shared.mp4?token=shared-token&encfilekey=key")
+                .unwrap();
+        let other_path =
+            Url::parse("https://finder.video.qq.com/other.mp4?token=shared-token").unwrap();
+        assert!(!has_matching_media_identity(&direct, &conflicting_token));
+        assert!(!has_matching_media_identity(
+            &keyed_direct,
+            &conflicting_key
+        ));
+        assert!(!has_matching_media_identity(&direct, &other_path));
     }
 
     #[test]
@@ -745,7 +867,7 @@ mod tests {
     }
 
     #[test]
-    fn builds_post_from_feed_fixture_and_derives_original_from_preferred_h264_seed() {
+    fn builds_post_from_feed_fixture_and_derives_media_from_preferred_h264_seed() {
         let normalized = NormalizedShareUrl {
             share_id: "A27pGwf5f9".to_owned(),
             canonical_url: Url::parse("https://weixin.qq.com/sph/A27pGwf5f9").unwrap(),
@@ -785,14 +907,14 @@ mod tests {
         assert_eq!(post.post_id, "export-id");
         assert_eq!(post.author.as_deref(), Some("测试作者"));
         assert_eq!(post.description.as_deref(), Some("测试视频"));
-        assert_eq!(post.video.provenance, MediaProvenance::DerivedOriginal);
+        assert_eq!(post.video.provenance, MediaSourceKind::Derived);
         assert_eq!(post.video.codec, VideoCodec::H264);
         assert_eq!(post.video.url.query(), Some("encfilekey=h&token=t"));
         assert_eq!(post.video.size_hint, None);
     }
 
     #[test]
-    fn accepts_root_level_feed_shape_and_prefers_explicit_origin() {
+    fn accepts_root_level_feed_shape_and_prefers_direct_source() {
         let normalized = NormalizedShareUrl {
             share_id: "A27pGwf5f9".to_owned(),
             canonical_url: Url::parse("https://weixin.qq.com/sph/A27pGwf5f9").unwrap(),
@@ -809,20 +931,95 @@ mod tests {
                 "h264VideoInfo": {
                     "videoUrl": "https://finder.video.qq.com/candidate.mp4?encfilekey=k&token=t&quality=hd"
                 },
-                "originVideoUrl": "https://finder.video.qq.com/original.mp4?token=t"
+                "originVideoUrl": "https://finder.video.qq.com/direct.mp4?token=t"
             }
         });
 
         let post = build_post(normalized, parse_data, feed, "export-id".to_owned()).unwrap();
-        assert_eq!(post.video.provenance, MediaProvenance::ExplicitOrigin);
+        assert_eq!(post.video.provenance, MediaSourceKind::Direct);
         assert_eq!(
             post.video.url.as_str(),
-            "https://finder.video.qq.com/original.mp4?token=t"
+            "https://finder.video.qq.com/direct.mp4?token=t"
         );
     }
 
     #[test]
-    fn rejects_a_post_when_original_cannot_be_derived() {
+    fn preserves_direct_identity_and_merges_metadata_when_urls_are_equal() {
+        let normalized = NormalizedShareUrl {
+            share_id: "A27pGwf5f9".to_owned(),
+            canonical_url: Url::parse("https://weixin.qq.com/sph/A27pGwf5f9").unwrap(),
+        };
+        let parse_data = ParseData {
+            wx_export_id: String::new(),
+            cover_url: String::new(),
+            author: String::new(),
+            desc: String::new(),
+            playable_url: "https://example.invalid/?token=dummy".to_owned(),
+        };
+        let shared_url = "https://findermp.video.qq.com/shared.mp4?token=t";
+        let feed = serde_json::json!({
+            "feedInfo": {
+                "h264VideoInfo": {
+                    "videoUrl": shared_url,
+                    "width": 1080,
+                    "height": 1920,
+                    "fileSize": 7654321,
+                    "decodeKey": "2136343393"
+                },
+                "originVideoUrl": shared_url
+            }
+        });
+
+        let post = build_post(normalized, parse_data, feed, "export-id".to_owned()).unwrap();
+        assert_eq!(post.video.provenance, MediaSourceKind::Direct);
+        assert_eq!(post.video.codec, VideoCodec::H264);
+        assert_eq!(
+            (post.video.width, post.video.height),
+            (Some(1080), Some(1920))
+        );
+        assert_eq!(post.video.size_hint, Some(7_654_321));
+        assert_eq!(post.video.decode_key, Some(2_136_343_393));
+    }
+
+    #[test]
+    fn direct_source_inherits_safe_matching_candidate_metadata() {
+        let normalized = NormalizedShareUrl {
+            share_id: "A27pGwf5f9".to_owned(),
+            canonical_url: Url::parse("https://weixin.qq.com/sph/A27pGwf5f9").unwrap(),
+        };
+        let parse_data = ParseData {
+            wx_export_id: String::new(),
+            cover_url: String::new(),
+            author: String::new(),
+            desc: String::new(),
+            playable_url: "https://example.invalid/?token=dummy".to_owned(),
+        };
+        let feed = serde_json::json!({
+            "feedInfo": {
+                "h265VideoInfo": {
+                    "videoUrl": "https://finder.video.wechat.com/shared.mp4?quality=hd&token=t&encfilekey=k",
+                    "width": 1920,
+                    "height": 1080,
+                    "fileSize": 123456,
+                    "decodeKey": 987654321
+                },
+                "originVideoUrl": "https://finder.video.wechat.com/shared.mp4?token=t"
+            }
+        });
+
+        let post = build_post(normalized, parse_data, feed, "export-id".to_owned()).unwrap();
+        assert_eq!(post.video.provenance, MediaSourceKind::Direct);
+        assert_eq!(post.video.codec, VideoCodec::H265);
+        assert_eq!(
+            (post.video.width, post.video.height),
+            (Some(1920), Some(1080))
+        );
+        assert_eq!(post.video.decode_key, Some(987_654_321));
+        assert_eq!(post.video.size_hint, None);
+    }
+
+    #[test]
+    fn rejects_a_post_when_no_media_source_can_be_derived() {
         let normalized = NormalizedShareUrl {
             share_id: "A27pGwf5f9".to_owned(),
             canonical_url: Url::parse("https://weixin.qq.com/sph/A27pGwf5f9").unwrap(),
@@ -844,11 +1041,11 @@ mod tests {
         });
 
         let error = build_post(normalized, parse_data, feed, "export-id".to_owned()).unwrap_err();
-        assert!(matches!(error, AppError::OriginalUnavailable));
+        assert!(matches!(error, AppError::MediaUnavailable));
     }
 
     #[test]
-    fn tries_h265_when_h264_cannot_derive_an_original() {
+    fn tries_h265_when_h264_cannot_derive_a_media_source() {
         let normalized = NormalizedShareUrl {
             share_id: "A27pGwf5f9".to_owned(),
             canonical_url: Url::parse("https://weixin.qq.com/sph/A27pGwf5f9").unwrap(),
@@ -873,7 +1070,7 @@ mod tests {
         });
 
         let post = build_post(normalized, parse_data, feed, "export-id".to_owned()).unwrap();
-        assert_eq!(post.video.provenance, MediaProvenance::DerivedOriginal);
+        assert_eq!(post.video.provenance, MediaSourceKind::Derived);
         assert_eq!(post.video.codec, VideoCodec::H265);
         assert_eq!(
             post.video.url.as_str(),
