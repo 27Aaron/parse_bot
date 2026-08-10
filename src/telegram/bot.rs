@@ -15,11 +15,13 @@ use tracing::{error, info, warn};
 
 use crate::{
     AppError, Result,
+    i18n::{self, Language, Status},
     media::{DownloadedMedia, MediaDownloader, MediaProbe, decrypt_file_prefix, probe_media},
     model::{MediaSource, ResolvedPost, TelegramMediaKind, VideoCodec},
-    storage::MediaCache,
+    storage::{MediaCache, UserSettings},
     telegram::api::{
-        InputFile, Message, TelegramClient, TelegramError, Update, VideoMetadata, escape_html,
+        BotCommand, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, InputFile, Message,
+        TelegramClient, TelegramError, Update, VideoMetadata, escape_html,
     },
     wechat::{WechatResolver, extract_share_url},
 };
@@ -51,6 +53,28 @@ struct MediaTask {
     chat_id: i64,
     status_message_id: i64,
     post: Arc<ResolvedPost>,
+    preferences: UserPreferences,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct UserPreferences {
+    language: Language,
+    show_source: bool,
+    show_progress: bool,
+    reply_to_source: bool,
+    show_video_cover: bool,
+}
+
+impl From<UserSettings> for UserPreferences {
+    fn from(settings: UserSettings) -> Self {
+        Self {
+            language: settings.language,
+            show_source: settings.show_source,
+            show_progress: settings.show_progress,
+            reply_to_source: settings.reply_to_source,
+            show_video_cover: settings.show_video_cover,
+        }
+    }
 }
 
 struct ParseTask {
@@ -61,6 +85,7 @@ struct ParseTask {
     share_url: url::Url,
     status_message_id: Option<i64>,
     cancellation: CancellationToken,
+    preferences: UserPreferences,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -357,6 +382,7 @@ impl BotService {
             result = self.telegram.get_me() => result.map_err(AppError::from)?,
         };
         info!(bot_id = me.id, username = ?me.username, "Telegram Bot API 已连接");
+        self.configure_commands().await;
 
         let mut offset = None;
         'polling: loop {
@@ -392,22 +418,298 @@ impl BotService {
         Ok(())
     }
 
+    async fn configure_commands(&self) {
+        // Telegram chooses the most specific command set matching the user's
+        // language.  The default is Chinese, while the other three sets keep
+        // the command menu useful before a user opens the settings panel.
+        for (language, language_code) in [
+            (Language::Chinese, None),
+            (Language::English, Some("en")),
+            (Language::Japanese, Some("ja")),
+            (Language::Russian, Some("ru")),
+        ] {
+            let commands = [
+                BotCommand::new("start", i18n::command_start(language)),
+                BotCommand::new("setting", i18n::command_setting(language)),
+            ];
+            if let Err(error) = self
+                .telegram
+                .set_my_commands(&commands, language_code)
+                .await
+            {
+                warn!(
+                    ?language,
+                    error = %error,
+                    "设置 Telegram 命令菜单失败，继续运行"
+                );
+            }
+        }
+    }
+
     async fn handle_update(&self, update: Update, shutdown: &CancellationToken) -> Result<()> {
+        if let Some(callback) = update.callback_query {
+            return self.handle_callback(callback, shutdown).await;
+        }
         if let Some(message) = update.message.filter(|message| message.text.is_some()) {
             return self.handle_message(message, shutdown).await;
         }
         Ok(())
     }
 
+    async fn handle_callback(
+        &self,
+        callback: CallbackQuery,
+        shutdown: &CancellationToken,
+    ) -> Result<()> {
+        let default_language = Language::Chinese;
+        let callback_language =
+            Language::from_telegram_code(callback.sender.language_code.as_deref());
+        let preferences = UserPreferences::from(
+            self.cache
+                .get_user_settings_with_default(callback.sender.id, callback_language)
+                .await
+                .unwrap_or_default(),
+        );
+        let Some(message) = callback.message.as_ref() else {
+            self.answer_callback(
+                &callback.id,
+                Some(i18n::invalid_setting(default_language)),
+                true,
+            )
+            .await;
+            return Ok(());
+        };
+        if !message.chat.is_private() {
+            self.answer_callback(
+                &callback.id,
+                Some(i18n::only_private_settings(preferences.language)),
+                true,
+            )
+            .await;
+            return Ok(());
+        }
+        let Some(data) = callback.data.as_deref() else {
+            self.answer_callback(
+                &callback.id,
+                Some(i18n::invalid_setting(preferences.language)),
+                true,
+            )
+            .await;
+            return Ok(());
+        };
+        let parts = data.split('|').collect::<Vec<_>>();
+        let valid_prefix = parts.first() == Some(&"setting") && parts.len() >= 3;
+        let owner_id = parts.get(1).and_then(|value| value.parse::<u64>().ok());
+        if !valid_prefix || owner_id != Some(callback.sender.id) {
+            self.answer_callback(
+                &callback.id,
+                Some(i18n::invalid_setting(preferences.language)),
+                true,
+            )
+            .await;
+            return Ok(());
+        }
+
+        let mut settings = self
+            .cache
+            .get_user_settings_with_default(callback.sender.id, callback_language)
+            .await
+            .unwrap_or_default();
+        let action = parts[2];
+        let mut notice = None;
+        match action {
+            "main" => {}
+            "done" => {
+                let referenced_message_id = message
+                    .reply_to_message
+                    .as_deref()
+                    .map(|reply| reply.message_id);
+                let result = tokio::select! {
+                    _ = shutdown.cancelled() => return Ok(()),
+                    result = self.telegram.delete_message(message.chat.id, message.message_id) => result,
+                };
+                if let Err(error) = result {
+                    warn!(error = %error, "删除设置面板失败");
+                }
+                if let Some(referenced_message_id) = referenced_message_id {
+                    let result = tokio::select! {
+                        _ = shutdown.cancelled() => return Ok(()),
+                        result = self.telegram.delete_message(
+                            message.chat.id,
+                            referenced_message_id,
+                        ) => result,
+                    };
+                    if let Err(error) = result {
+                        warn!(
+                            error = %error,
+                            message_id = referenced_message_id,
+                            "删除设置命令消息失败"
+                        );
+                    }
+                }
+                self.answer_callback(&callback.id, None, false).await;
+                return Ok(());
+            }
+            "language" => {
+                let text = format!(
+                    "<b>{}</b>\n\n{}",
+                    i18n::settings_panel_title(settings.language),
+                    i18n::language_panel(settings.language)
+                );
+                let keyboard = language_keyboard(callback.sender.id, settings.language);
+                let result = tokio::select! {
+                    _ = shutdown.cancelled() => return Ok(()),
+                    result = self.telegram.edit_message_text_html(
+                        message.chat.id,
+                        message.message_id,
+                        &text,
+                        Some(&keyboard),
+                    ) => result,
+                };
+                result.map_err(AppError::from)?;
+                self.answer_callback(&callback.id, None, false).await;
+                return Ok(());
+            }
+            "lang" => {
+                let Some(language_code) = parts.get(3).and_then(|value| Language::from_code(value))
+                else {
+                    self.answer_callback(
+                        &callback.id,
+                        Some(i18n::invalid_setting(settings.language)),
+                        true,
+                    )
+                    .await;
+                    return Ok(());
+                };
+                settings.language = language_code;
+                notice = Some(i18n::settings_saved(language_code));
+                self.cache
+                    .put_user_settings(callback.sender.id, settings)
+                    .await?;
+            }
+            "source" => {
+                settings.show_source = !settings.show_source;
+                notice = Some(i18n::settings_saved(settings.language));
+                self.cache
+                    .put_user_settings(callback.sender.id, settings)
+                    .await?;
+            }
+            "progress" => {
+                settings.show_progress = !settings.show_progress;
+                notice = Some(i18n::settings_saved(settings.language));
+                self.cache
+                    .put_user_settings(callback.sender.id, settings)
+                    .await?;
+            }
+            "reply" => {
+                settings.reply_to_source = !settings.reply_to_source;
+                notice = Some(i18n::settings_saved(settings.language));
+                self.cache
+                    .put_user_settings(callback.sender.id, settings)
+                    .await?;
+            }
+            "cover" => {
+                settings.show_video_cover = !settings.show_video_cover;
+                notice = Some(i18n::settings_saved(settings.language));
+                self.cache
+                    .put_user_settings(callback.sender.id, settings)
+                    .await?;
+            }
+            _ => {
+                self.answer_callback(
+                    &callback.id,
+                    Some(i18n::invalid_setting(settings.language)),
+                    true,
+                )
+                .await;
+                return Ok(());
+            }
+        }
+
+        let preferences = UserPreferences::from(settings);
+        let (panel, keyboard) =
+            settings_panel(preferences.language, preferences, callback.sender.id);
+        let result = tokio::select! {
+            _ = shutdown.cancelled() => return Ok(()),
+            result = self.telegram.edit_message_text_html(
+                message.chat.id,
+                message.message_id,
+                &panel,
+                Some(&keyboard),
+            ) => result,
+        };
+        result.map_err(AppError::from)?;
+        self.answer_callback(&callback.id, notice, false).await;
+        Ok(())
+    }
+
+    async fn answer_callback(&self, callback_id: &str, text: Option<&str>, show_alert: bool) {
+        let _ = self
+            .telegram
+            .answer_callback_query(callback_id, text, show_alert)
+            .await;
+    }
+
+    async fn send_text_with_policy(
+        &self,
+        chat_id: i64,
+        text: &str,
+        source_message_id: i64,
+        preferences: UserPreferences,
+    ) -> std::result::Result<Message, TelegramError> {
+        if preferences.reply_to_source {
+            self.telegram
+                .send_message_reply(chat_id, text, source_message_id, None)
+                .await
+        } else {
+            self.telegram.send_message(chat_id, text, None).await
+        }
+    }
+
+    async fn send_html_with_policy(
+        &self,
+        chat_id: i64,
+        text: &str,
+        source_message_id: i64,
+        preferences: UserPreferences,
+        reply_markup: Option<&InlineKeyboardMarkup>,
+    ) -> std::result::Result<Message, TelegramError> {
+        if preferences.reply_to_source {
+            self.telegram
+                .send_message_reply_html(chat_id, text, source_message_id, reply_markup)
+                .await
+        } else {
+            self.telegram
+                .send_message_html(chat_id, text, reply_markup)
+                .await
+        }
+    }
+
     async fn handle_message(&self, message: Message, shutdown: &CancellationToken) -> Result<()> {
         let Some(user_id) = message.sender_id() else {
             return Ok(());
         };
+        let telegram_language = Language::from_telegram_code(
+            message
+                .sender
+                .as_ref()
+                .and_then(|user| user.language_code.as_deref()),
+        );
+        let preferences = UserPreferences::from(
+            self.cache
+                .get_user_settings_with_default(user_id, telegram_language)
+                .await?,
+        );
         let chat_id = message.chat.id;
         if !message.chat.is_private() {
             tokio::select! {
                 _ = shutdown.cancelled() => {}
-                _ = self.telegram.send_message(chat_id, "首版只在私聊中工作。", None) => {}
+                _ = self.send_text_with_policy(
+                    chat_id,
+                    i18n::non_private(preferences.language),
+                    message.message_id,
+                    preferences,
+                ) => {}
             }
             return Ok(());
         }
@@ -415,10 +717,31 @@ impl BotService {
         let text = message.text.as_deref().unwrap_or_default().trim();
         match command_name(text) {
             Some("start") => {
-                let help = format_help_text(self.required_channel_id.as_deref());
+                let help =
+                    i18n::start_text(preferences.language, self.required_channel_id.as_deref());
                 tokio::select! {
                     _ = shutdown.cancelled() => {}
-                    result = self.telegram.send_message(chat_id, &help, None) => {
+                    result = self.send_text_with_policy(
+                        chat_id,
+                        &help,
+                        message.message_id,
+                        preferences,
+                    ) => {
+                        result?;
+                    }
+                }
+            }
+            Some("setting") => {
+                let (panel, keyboard) = settings_panel(preferences.language, preferences, user_id);
+                tokio::select! {
+                    _ = shutdown.cancelled() => {}
+                    result = self.send_html_with_policy(
+                        chat_id,
+                        &panel,
+                        message.message_id,
+                        preferences,
+                        Some(&keyboard),
+                    ) => {
                         result?;
                     }
                 }
@@ -426,10 +749,11 @@ impl BotService {
             Some(_) => {
                 tokio::select! {
                     _ = shutdown.cancelled() => {}
-                    result = self.telegram.send_message(
+                    result = self.send_text_with_policy(
                         chat_id,
-                        "请直接发送微信视频号链接。",
-                        None,
+                        i18n::direct_link(preferences.language),
+                        message.message_id,
+                        preferences,
                     ) => {
                         result?;
                     }
@@ -441,6 +765,7 @@ impl BotService {
                     user_id,
                     message.message_id,
                     text.to_owned(),
+                    preferences,
                     shutdown,
                 )
                 .await?;
@@ -455,18 +780,20 @@ impl BotService {
         user_id: u64,
         source_message_id: i64,
         input: String,
+        preferences: UserPreferences,
         shutdown: &CancellationToken,
     ) -> Result<()> {
         let share_url = match extract_share_url(&input) {
             Ok(url) => url,
             Err(error) => {
+                let message = error.localized_message(preferences.language);
                 tokio::select! {
                     _ = shutdown.cancelled() => return Err(AppError::Cancelled),
-                    result = self.telegram.send_message_reply(
+                    result = self.send_text_with_policy(
                         chat_id,
-                        error.user_message(),
+                        &message,
                         source_message_id,
-                        None,
+                        preferences,
                     ) => result?,
                 };
                 return Ok(());
@@ -484,6 +811,7 @@ impl BotService {
                     share_url,
                     status_message_id: None,
                     cancellation,
+                    preferences,
                 }),
                 Admission::Queued {
                     task_id,
@@ -499,6 +827,7 @@ impl BotService {
                             share_url,
                             status_message_id: None,
                             cancellation,
+                            preferences,
                         },
                     );
                     QueueAction::Wait {
@@ -516,16 +845,17 @@ impl BotService {
                 task_id,
                 waiting_count,
             } => {
-                let text = format_queue_status(waiting_count);
+                let text = i18n::queue(preferences.language, waiting_count);
                 let status = tokio::select! {
                     _ = shutdown.cancelled() => {
                         self.withdraw_waiting_task(task_id).await;
                         return Err(AppError::Cancelled);
                     }
-                    result = self.telegram.send_message_reply_html(
+                    result = self.send_html_with_policy(
                         chat_id,
                         &text,
                         source_message_id,
+                        preferences,
                         None,
                     ) => match result {
                         Ok(message) => message,
@@ -565,22 +895,22 @@ impl BotService {
             QueueAction::Reject(QueueRejection::UserQueueFull) => {
                 tokio::select! {
                     _ = shutdown.cancelled() => return Err(AppError::Cancelled),
-                    result = self.telegram.send_message_reply(
+                    result = self.send_text_with_policy(
                         chat_id,
-                        "你的等待队列已满（最多 3 个任务），请等待当前任务完成后再发送。",
+                        i18n::user_queue_full(preferences.language),
                         source_message_id,
-                        None,
+                        preferences,
                     ) => result?,
                 };
             }
             QueueAction::Reject(QueueRejection::GlobalQueueFull) => {
                 tokio::select! {
                     _ = shutdown.cancelled() => return Err(AppError::Cancelled),
-                    result = self.telegram.send_message_reply(
+                    result = self.send_text_with_policy(
                         chat_id,
-                        "当前等待队列已满（最多 100 个任务），请稍后再发送链接。",
+                        i18n::global_queue_full(preferences.language),
                         source_message_id,
-                        None,
+                        preferences,
                     ) => result?,
                 };
             }
@@ -651,7 +981,7 @@ impl BotService {
                     result = self.telegram.edit_message_text_html(
                         task.chat_id,
                         status_message_id,
-                        "<b>▎解 析 中...</b>",
+                        i18n::status(task.preferences.language, Status::Parsing),
                         None,
                     ) => {
                         if let Err(error) = result {
@@ -664,10 +994,11 @@ impl BotService {
             None => {
                 tokio::select! {
                     _ = cancellation.cancelled() => return Err(AppError::Cancelled),
-                    result = self.telegram.send_message_reply_html(
+                    result = self.send_html_with_policy(
                         task.chat_id,
-                        "<b>▎解 析 中...</b>",
+                        i18n::status(task.preferences.language, Status::Parsing),
                         task.source_message_id,
+                        task.preferences,
                         None,
                     ) => result?.message_id,
                 }
@@ -680,6 +1011,7 @@ impl BotService {
                 task.user_id,
                 task.source_message_id,
                 cancellation,
+                task.preferences,
             )
             .await;
         match channel_allowed {
@@ -692,8 +1024,14 @@ impl BotService {
                 return Ok(());
             }
             Err(error) => {
-                self.edit_error_status(task.chat_id, status_message_id, &error, cancellation)
-                    .await;
+                self.edit_error_status(
+                    task.chat_id,
+                    status_message_id,
+                    &error,
+                    cancellation,
+                    task.preferences.language,
+                )
+                .await;
                 return Err(error);
             }
         }
@@ -706,8 +1044,14 @@ impl BotService {
         let post = match resolved {
             Ok(post) => Arc::new(post),
             Err(error) => {
-                self.edit_error_status(task.chat_id, status_message_id, &error, cancellation)
-                    .await;
+                self.edit_error_status(
+                    task.chat_id,
+                    status_message_id,
+                    &error,
+                    cancellation,
+                    task.preferences.language,
+                )
+                .await;
                 return Err(error);
             }
         };
@@ -715,12 +1059,19 @@ impl BotService {
             chat_id: task.chat_id,
             status_message_id,
             post,
+            preferences: task.preferences,
         };
 
         let result = self.run_download(&media_task, cancellation).await;
         if let Err(error) = &result {
-            self.edit_error_status(task.chat_id, status_message_id, error, cancellation)
-                .await;
+            self.edit_error_status(
+                task.chat_id,
+                status_message_id,
+                error,
+                cancellation,
+                task.preferences.language,
+            )
+            .await;
         }
         result
     }
@@ -731,13 +1082,15 @@ impl BotService {
         status_message_id: i64,
         error: &AppError,
         cancellation: &CancellationToken,
+        language: Language,
     ) {
+        let message = error.localized_message(language);
         tokio::select! {
             _ = cancellation.cancelled() => {}
             _ = self.telegram.edit_message_text(
                 chat_id,
                 status_message_id,
-                error.user_message(),
+                &message,
                 None,
             ) => {}
         }
@@ -747,14 +1100,30 @@ impl BotService {
         if cancellation.is_cancelled() {
             return Err(AppError::Cancelled);
         }
-        let caption = format_caption(&task.post);
+        let caption = format_caption(
+            &task.post,
+            task.preferences.language,
+            task.preferences.show_source,
+        );
+        let cover = if task.preferences.show_video_cover {
+            task.post
+                .cover_url
+                .as_ref()
+                .and_then(|url| InputFile::http_url(url).ok())
+        } else {
+            None
+        };
         if let Some(cached) = self
             .cache
             .get(&task.post.platform, &task.post.post_id)
             .await?
         {
-            self.update_status_html(task, "<b>▎发 送 中...</b>", cancellation)
-                .await;
+            self.update_status_html(
+                task,
+                i18n::status(task.preferences.language, Status::Sending),
+                cancellation,
+            )
+            .await;
             let input = InputFile::file_id(cached.file_id.clone())?;
             let cached_edit = tokio::select! {
                 _ = cancellation.cancelled() => return Err(AppError::Cancelled),
@@ -765,7 +1134,27 @@ impl BotService {
                     &input,
                     &caption,
                     None,
+                    cover.as_ref(),
                 ) => result,
+            };
+            let cached_edit = if cached.kind == TelegramMediaKind::Video
+                && cover.is_some()
+                && cached_edit.is_err()
+            {
+                tokio::select! {
+                    _ = cancellation.cancelled() => return Err(AppError::Cancelled),
+                    result = self.edit_media(
+                        task.chat_id,
+                        task.status_message_id,
+                        cached.kind,
+                        &input,
+                        &caption,
+                        None,
+                        None,
+                    ) => result,
+                }
+            } else {
+                cached_edit
             };
             match cached_edit {
                 Ok(_) => return Ok(()),
@@ -783,21 +1172,33 @@ impl BotService {
             _ = cancellation.cancelled() => return Err(AppError::Cancelled),
             permit = self.media_slots.acquire() => permit.map_err(|_| AppError::Cancelled)?,
         };
-        self.update_status_html(task, "<b>▎下 载 中...</b>", cancellation)
-            .await;
+        self.update_status_html(
+            task,
+            i18n::status(task.preferences.language, Status::Downloading),
+            cancellation,
+        )
+        .await;
         let first_download = self.download_with_status(&source, task, cancellation).await;
         let downloaded = match first_download {
             Ok(downloaded) => downloaded,
             Err(AppError::Expired) => {
-                self.update_status_html(task, "<b>▎解 析 中...</b>", cancellation)
-                    .await;
+                self.update_status_html(
+                    task,
+                    i18n::status(task.preferences.language, Status::Parsing),
+                    cancellation,
+                )
+                .await;
                 let refreshed = tokio::select! {
                     _ = cancellation.cancelled() => return Err(AppError::Cancelled),
                     result = self.resolver.resolve_url(&task.post.canonical_url) => result?,
                 };
                 source = refreshed.video;
-                self.update_status_html(task, "<b>▎下 载 中...</b>", cancellation)
-                    .await;
+                self.update_status_html(
+                    task,
+                    i18n::status(task.preferences.language, Status::Downloading),
+                    cancellation,
+                )
+                .await;
                 self.download_with_status(&source, task, cancellation)
                     .await?
             }
@@ -831,8 +1232,12 @@ impl BotService {
             // With a local Bot API `file://` input, TDLib performs the real
             // Telegram upload internally and exposes no byte progress. Only
             // the start of the request and its successful completion are real.
-            self.update_status_html(task, "<b>▎上 传 中...</b>", cancellation)
-                .await;
+            self.update_status_html(
+                task,
+                i18n::status(task.preferences.language, Status::Uploading),
+                cancellation,
+            )
+            .await;
 
             let input = InputFile::local_path(&downloaded.path)?;
             let edit_result = tokio::select! {
@@ -844,8 +1249,26 @@ impl BotService {
                     &input,
                     &caption,
                     Some(video_metadata),
+                    cover.as_ref(),
                 ) => result,
             };
+            let edit_result =
+                if kind == TelegramMediaKind::Video && cover.is_some() && edit_result.is_err() {
+                    tokio::select! {
+                        _ = cancellation.cancelled() => return Err(AppError::Cancelled),
+                        result = self.edit_media(
+                            task.chat_id,
+                            task.status_message_id,
+                            kind,
+                            &input,
+                            &caption,
+                            Some(video_metadata),
+                            None,
+                        ) => result,
+                    }
+                } else {
+                    edit_result
+                };
             let edited = match edit_result {
                 Ok(message) => message,
                 Err(error)
@@ -859,6 +1282,7 @@ impl BotService {
                             TelegramMediaKind::Document,
                             &input,
                             &caption,
+                            None,
                             None,
                         ) => result?,
                     }
@@ -913,14 +1337,14 @@ impl BotService {
                 biased;
                 _ = cancellation.cancelled() => return Err(AppError::Cancelled),
                 Some(progress) = progress_receiver.recv() => {
-                    if progress.percent > last_percent {
+                    if task.preferences.show_progress && progress.percent > last_percent {
                         last_percent = progress.percent;
                         self.update_download_status(task, progress.percent, cancellation).await;
                     }
                 }
                 result = &mut download => {
                     let downloaded = result?;
-                    if last_percent < 100 {
+                    if task.preferences.show_progress && last_percent < 100 {
                         self.update_download_status(task, 100, cancellation).await;
                     }
                     return Ok(downloaded);
@@ -935,7 +1359,7 @@ impl BotService {
         percent: u8,
         cancellation: &CancellationToken,
     ) {
-        let text = format_download_status(percent);
+        let text = i18n::download_status(task.preferences.language, percent);
         self.update_status_html(task, &text, cancellation).await;
     }
 
@@ -960,6 +1384,7 @@ impl BotService {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn edit_media(
         &self,
         chat_id: i64,
@@ -968,24 +1393,33 @@ impl BotService {
         input: &InputFile,
         caption: &str,
         video_metadata: Option<VideoMetadata>,
+        cover: Option<&InputFile>,
     ) -> std::result::Result<Message, TelegramError> {
         match kind {
             TelegramMediaKind::Video => match video_metadata {
                 Some(metadata) => {
                     self.telegram
-                        .edit_message_video_html_with_metadata(
+                        .edit_message_video_html_with_metadata_and_cover(
                             chat_id,
                             message_id,
                             input,
                             Some(caption),
                             metadata,
+                            cover,
                             None,
                         )
                         .await
                 }
                 None => {
                     self.telegram
-                        .edit_message_video_html(chat_id, message_id, input, Some(caption), None)
+                        .edit_message_video_html_with_cover(
+                            chat_id,
+                            message_id,
+                            input,
+                            Some(caption),
+                            cover,
+                            None,
+                        )
                         .await
                 }
             },
@@ -1003,6 +1437,7 @@ impl BotService {
         user_id: u64,
         source_message_id: i64,
         cancellation: &CancellationToken,
+        preferences: UserPreferences,
     ) -> Result<bool> {
         let Some(channel_id) = self.required_channel_id.as_deref() else {
             return Ok(true);
@@ -1015,13 +1450,14 @@ impl BotService {
         match membership {
             Ok(member) if member.has_joined() => Ok(true),
             Ok(_) => {
-                let prompt = format_channel_requirement(channel_id);
+                let prompt = format_channel_requirement(preferences.language, channel_id);
                 tokio::select! {
                     _ = cancellation.cancelled() => return Err(AppError::Cancelled),
-                    result = self.telegram.send_message_reply_html(
+                    result = self.send_html_with_policy(
                         chat_id,
                         &prompt,
                         source_message_id,
+                        preferences,
                         None,
                     ) => {
                         result?;
@@ -1038,11 +1474,11 @@ impl BotService {
                 );
                 tokio::select! {
                     _ = cancellation.cancelled() => return Err(AppError::Cancelled),
-                    result = self.telegram.send_message_reply(
+                    result = self.send_text_with_policy(
                         chat_id,
-                        "暂时无法验证频道关注状态，请稍后重试。",
+                        i18n::channel_check_failed(preferences.language),
                         source_message_id,
-                        None,
+                        preferences,
                     ) => {
                         result?;
                     }
@@ -1118,41 +1554,122 @@ fn telegram_video_metadata(probe: &MediaProbe) -> VideoMetadata {
     VideoMetadata::new(probe.width, probe.height, duration)
 }
 
-fn format_caption(post: &ResolvedPost) -> String {
-    format_caption_parts(&post.display_title(), post.canonical_url.as_str())
-}
-
-fn format_caption_parts(title: &str, source: &str) -> String {
-    let title = escape_html(title);
-    let source = escape_html(source);
-    format!("{title}\n\n<b>▎<a href=\"{source}\">Source</a></b>")
-}
-
-fn format_help_text(required_channel_id: Option<&str>) -> String {
-    let mut text = String::from("发送微信视频号链接或分享文案，我会自动下载并发送视频。");
-    if let Some(channel_id) = required_channel_id {
-        text.push_str("\n\n使用前需要关注频道 ");
-        text.push_str(channel_id);
-        text.push('。');
-    }
-    text
-}
-
-fn format_channel_requirement(channel_id: &str) -> String {
-    let username = channel_id.trim_start_matches('@');
-    let label = escape_html(channel_id);
-    let url = escape_html(&format!("https://t.me/{username}"));
-    format!(
-        "使用此机器人前，请先关注频道。\n\n<b>▎<a href=\"{url}\">{label}</a></b>\n\n关注后重新发送链接即可。"
+fn format_caption(post: &ResolvedPost, language: Language, show_source: bool) -> String {
+    format_caption_parts(
+        &post.display_title(),
+        post.canonical_url.as_str(),
+        language,
+        show_source,
     )
 }
 
-fn format_download_status(percent: u8) -> String {
-    format!("<b>▎下 载 中... | {percent}%</b>")
+fn format_caption_parts(
+    title: &str,
+    source: &str,
+    language: Language,
+    show_source: bool,
+) -> String {
+    let title = escape_html(title);
+    if !show_source {
+        return title;
+    }
+    let source = escape_html(source);
+    format!(
+        "{title}\n\n<b>▎<a href=\"{source}\">{}</a></b>",
+        i18n::source_label(language)
+    )
 }
 
+#[cfg(test)]
+fn format_help_text(required_channel_id: Option<&str>) -> String {
+    i18n::start_text(Language::Chinese, required_channel_id)
+}
+
+fn format_channel_requirement(language: Language, channel_id: &str) -> String {
+    let username = channel_id.trim_start_matches('@');
+    i18n::channel_requirement(language, channel_id, &format!("https://t.me/{username}"))
+}
+
+#[cfg(test)]
+fn format_download_status(percent: u8) -> String {
+    i18n::download_status(Language::Chinese, percent)
+}
+
+#[cfg(test)]
 fn format_queue_status(waiting_count: usize) -> String {
-    format!("<b>▎排 队 中...</b>\n\n当前共有 {waiting_count} 个任务等待调度，轮到后会自动解析。")
+    i18n::queue(Language::Chinese, waiting_count)
+}
+
+fn settings_panel(
+    language: Language,
+    preferences: UserPreferences,
+    user_id: u64,
+) -> (String, InlineKeyboardMarkup) {
+    // Keep the message itself compact.  The current values are already shown
+    // on the inline buttons below; repeating them in the message creates a
+    // large highlighted block in Telegram clients.
+    let text = format!("<b>{}</b>", i18n::settings_panel_title(language));
+    let keyboard = InlineKeyboardMarkup::new(vec![
+        vec![InlineKeyboardButton::callback(
+            i18n::language_setting_label(preferences.language),
+            format!("setting|{user_id}|language"),
+        )],
+        vec![
+            InlineKeyboardButton::callback(
+                i18n::source_setting_label(language, preferences.show_source),
+                format!("setting|{user_id}|source"),
+            ),
+            InlineKeyboardButton::callback(
+                i18n::progress_setting_label(language, preferences.show_progress),
+                format!("setting|{user_id}|progress"),
+            ),
+        ],
+        vec![
+            InlineKeyboardButton::callback(
+                i18n::reply_setting_label(language, preferences.reply_to_source),
+                format!("setting|{user_id}|reply"),
+            ),
+            InlineKeyboardButton::callback(
+                i18n::cover_setting_label(language, preferences.show_video_cover),
+                format!("setting|{user_id}|cover"),
+            ),
+        ],
+        vec![InlineKeyboardButton::callback(
+            i18n::done(language),
+            format!("setting|{user_id}|done"),
+        )],
+    ]);
+    (text, keyboard)
+}
+
+fn language_keyboard(user_id: u64, current_language: Language) -> InlineKeyboardMarkup {
+    let buttons = Language::ALL
+        .into_iter()
+        .map(|language| {
+            let marker = if language == current_language {
+                "✓ "
+            } else {
+                ""
+            };
+            InlineKeyboardButton::callback(
+                format!("{marker}{}", language.label()),
+                format!("setting|{user_id}|lang|{}", language.code()),
+            )
+        })
+        .collect();
+    InlineKeyboardMarkup::new(vec![
+        buttons,
+        vec![
+            InlineKeyboardButton::callback(
+                i18n::back(current_language),
+                format!("setting|{user_id}|main"),
+            ),
+            InlineKeyboardButton::callback(
+                i18n::done(current_language),
+                format!("setting|{user_id}|done"),
+            ),
+        ],
+    ])
 }
 
 #[cfg(test)]
@@ -1163,6 +1680,7 @@ mod tests {
     fn recognizes_only_start_as_the_supported_command() {
         assert_eq!(command_name("/start"), Some("start"));
         assert_eq!(command_name("/start@parse_bot"), Some("start"));
+        assert_eq!(command_name("/setting"), Some("setting"));
         assert_ne!(command_name("/unknown"), Some("start"));
         assert_eq!(command_name("https://weixin.qq.com/sph/example"), None);
     }
@@ -1203,9 +1721,11 @@ mod tests {
         assert_eq!(
             format_caption_parts(
                 "标题 <视频> & 测试",
-                "https://weixin.qq.com/sph/example?a=1&b=2"
+                "https://weixin.qq.com/sph/example?a=1&b=2",
+                Language::Chinese,
+                true,
             ),
-            "标题 &lt;视频&gt; &amp; 测试\n\n<b>▎<a href=\"https://weixin.qq.com/sph/example?a=1&amp;b=2\">Source</a></b>"
+            "标题 &lt;视频&gt; &amp; 测试\n\n<b>▎<a href=\"https://weixin.qq.com/sph/example?a=1&amp;b=2\">来源</a></b>"
         );
     }
 
@@ -1377,7 +1897,7 @@ mod tests {
     #[test]
     fn formats_a_clickable_channel_requirement() {
         assert_eq!(
-            format_channel_requirement("@Aaron_Channels"),
+            format_channel_requirement(Language::Chinese, "@Aaron_Channels"),
             "使用此机器人前，请先关注频道。\n\n<b>▎<a href=\"https://t.me/Aaron_Channels\">@Aaron_Channels</a></b>\n\n关注后重新发送链接即可。"
         );
     }

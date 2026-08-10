@@ -441,7 +441,7 @@ fn build_post(
     let cover_url = text_at(feed_info, "coverUrl")
         .or_else(|| non_empty(parse_data.cover_url))
         .and_then(|raw| Url::parse(&raw).ok())
-        .filter(is_safe_https_url);
+        .filter(is_allowed_media_url);
     let expires_at = data
         .get("sceneInfo")
         .and_then(|value| number_at(value, "expiredTime"))
@@ -596,14 +596,6 @@ fn is_allowed_media_url(url: &Url) -> bool {
         && url
             .host_str()
             .is_some_and(|host| !host.ends_with('.') && REVIEWED_WECHAT_MEDIA_HOSTS.contains(&host))
-}
-
-fn is_safe_https_url(url: &Url) -> bool {
-    url.scheme() == "https"
-        && url.username().is_empty()
-        && url.password().is_none()
-        && url.port().is_none()
-        && url.host_str().is_some()
 }
 
 fn endpoint_is_loopback_http(url: &Url) -> bool {
