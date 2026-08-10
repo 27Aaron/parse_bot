@@ -1,4 +1,14 @@
-use std::{path::Path, process::Stdio, time::Duration};
+use std::{
+    env,
+    ffi::OsStr,
+    fs,
+    path::{Path, PathBuf},
+    process::Stdio,
+    time::Duration,
+};
+
+#[cfg(unix)]
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
 use serde::Deserialize;
 use serde_json::Value;
@@ -11,11 +21,18 @@ use crate::{
 
 const FFPROBE_TIMEOUT: Duration = Duration::from_secs(20);
 const MAX_PROBE_JSON_BYTES: usize = 1024 * 1024;
+#[cfg(target_os = "linux")]
+const FFPROBE_ADDRESS_SPACE_LIMIT_BYTES: libc::rlim_t = 1024 * 1024 * 1024;
+#[cfg(unix)]
+const FFPROBE_CPU_LIMIT_SECONDS: libc::rlim_t = 25;
+#[cfg(not(windows))]
+const FFPROBE_BINARY_NAME: &str = "ffprobe";
+#[cfg(windows)]
+const FFPROBE_BINARY_NAME: &str = "ffprobe.exe";
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct MediaProbe {
     pub codec: VideoCodec,
-    pub has_audio: bool,
     /// Display width after applying sample aspect ratio and orientation metadata.
     pub width: u32,
     /// Display height after applying sample aspect ratio and orientation metadata.
@@ -35,9 +52,13 @@ pub async fn probe_media(path: impl AsRef<Path>) -> Result<MediaProbe> {
         ));
     }
 
-    let mut command = Command::new("ffprobe");
+    let ffprobe_path = resolve_ffprobe_from_environment()?;
+    let mut command = Command::new(ffprobe_path);
     command
         .kill_on_drop(true)
+        .env_clear()
+        .env("LANG", "C")
+        .env("LC_ALL", "C")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -58,12 +79,17 @@ pub async fn probe_media(path: impl AsRef<Path>) -> Result<MediaProbe> {
         .arg("mov")
         .arg("-i")
         .arg(path);
+    apply_ffprobe_resource_limits(&mut command);
 
     let mut child = match command.spawn() {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             return Err(AppError::Config("未找到 ffprobe 可执行文件".to_owned()));
         }
-        Err(_) => return Err(AppError::InvalidMedia("无法启动 ffprobe".to_owned())),
+        Err(_) => {
+            return Err(AppError::Config(
+                "无法启动 ffprobe，请检查执行权限和进程资源限制".to_owned(),
+            ));
+        }
         Ok(child) => child,
     };
     let stdout = child
@@ -107,6 +133,142 @@ pub async fn probe_media(path: impl AsRef<Path>) -> Result<MediaProbe> {
         )));
     }
     parse_probe_json(&json)
+}
+
+#[cfg(unix)]
+fn apply_ffprobe_resource_limits(command: &mut Command) {
+    // SAFETY: the hook performs only async-signal-safe setrlimit syscalls and
+    // constructs an errno-backed I/O error on failure. It runs in the child
+    // immediately before exec, so it cannot affect the Bot process itself.
+    unsafe {
+        command.pre_exec(|| {
+            #[cfg(target_os = "linux")]
+            {
+                let mut inherited = libc::rlimit {
+                    rlim_cur: 0,
+                    rlim_max: 0,
+                };
+                if libc::getrlimit(libc::RLIMIT_AS, &mut inherited) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                let address_space = libc::rlimit {
+                    rlim_cur: inherited.rlim_cur.min(FFPROBE_ADDRESS_SPACE_LIMIT_BYTES),
+                    rlim_max: inherited.rlim_max.min(FFPROBE_ADDRESS_SPACE_LIMIT_BYTES),
+                };
+                if libc::setrlimit(libc::RLIMIT_AS, &address_space) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+            }
+            let mut inherited = libc::rlimit {
+                rlim_cur: 0,
+                rlim_max: 0,
+            };
+            if libc::getrlimit(libc::RLIMIT_CPU, &mut inherited) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            let cpu = libc::rlimit {
+                rlim_cur: inherited.rlim_cur.min(FFPROBE_CPU_LIMIT_SECONDS),
+                rlim_max: inherited.rlim_max.min(FFPROBE_CPU_LIMIT_SECONDS),
+            };
+            if libc::setrlimit(libc::RLIMIT_CPU, &cpu) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+}
+
+#[cfg(not(unix))]
+fn apply_ffprobe_resource_limits(_command: &mut Command) {}
+
+fn resolve_ffprobe_from_environment() -> Result<PathBuf> {
+    let configured = env::var_os("FFPROBE_PATH");
+    let search_path = env::var_os("PATH");
+    resolve_ffprobe_path(configured.as_deref(), search_path.as_deref())
+}
+
+fn resolve_ffprobe_path(
+    configured: Option<&OsStr>,
+    search_path: Option<&OsStr>,
+) -> Result<PathBuf> {
+    if let Some(configured) = configured {
+        let configured = Path::new(configured);
+        if !configured.is_absolute() {
+            return Err(invalid_configured_ffprobe());
+        }
+        return canonical_executable(configured).ok_or_else(invalid_configured_ffprobe);
+    }
+
+    ffprobe_candidates(search_path)
+        .into_iter()
+        .find_map(|candidate| canonical_executable(&candidate))
+        .ok_or_else(|| {
+            AppError::Config(
+                "未找到安全的 ffprobe 可执行文件，请设置绝对路径 FFPROBE_PATH".to_owned(),
+            )
+        })
+}
+
+fn ffprobe_candidates(search_path: Option<&OsStr>) -> Vec<PathBuf> {
+    search_path
+        .map(env::split_paths)
+        .into_iter()
+        .flatten()
+        .filter(|directory| directory.is_absolute())
+        .map(|directory| directory.join(FFPROBE_BINARY_NAME))
+        .collect()
+}
+
+fn canonical_executable(path: &Path) -> Option<PathBuf> {
+    if !path.is_absolute() {
+        return None;
+    }
+    let canonical = fs::canonicalize(path).ok()?;
+    if !canonical.is_absolute() {
+        return None;
+    }
+    let metadata = fs::metadata(&canonical).ok()?;
+    (is_executable_file(&metadata) && executable_path_is_trusted(&canonical, &metadata))
+        .then_some(canonical)
+}
+
+#[cfg(unix)]
+fn is_executable_file(metadata: &fs::Metadata) -> bool {
+    metadata.is_file() && metadata.permissions().mode() & 0o111 != 0
+}
+
+#[cfg(unix)]
+fn executable_path_is_trusted(path: &Path, metadata: &fs::Metadata) -> bool {
+    // SAFETY: geteuid takes no pointers and has no preconditions.
+    let effective_user_id = unsafe { libc::geteuid() };
+    let trusted_owner = |owner| owner == 0 || owner == effective_user_id;
+    if !trusted_owner(metadata.uid()) || metadata.permissions().mode() & 0o022 != 0 {
+        return false;
+    }
+    path.ancestors().skip(1).all(|directory| {
+        let Ok(metadata) = fs::metadata(directory) else {
+            return false;
+        };
+        if !metadata.is_dir() || !trusted_owner(metadata.uid()) {
+            return false;
+        }
+        let mode = metadata.permissions().mode();
+        mode & 0o022 == 0 || mode & 0o1000 != 0
+    })
+}
+
+#[cfg(not(unix))]
+fn is_executable_file(metadata: &fs::Metadata) -> bool {
+    metadata.is_file()
+}
+
+#[cfg(not(unix))]
+fn executable_path_is_trusted(_path: &Path, _metadata: &fs::Metadata) -> bool {
+    true
+}
+
+fn invalid_configured_ffprobe() -> AppError {
+    AppError::Config("FFPROBE_PATH 必须是指向普通可执行文件的绝对路径".to_owned())
 }
 
 #[derive(Debug, Deserialize)]
@@ -171,11 +333,6 @@ fn parse_probe_json(json: &[u8]) -> Result<MediaProbe> {
     let document: ProbeDocument = serde_json::from_slice(json)
         .map_err(|_| AppError::InvalidMedia("ffprobe 返回了无效 JSON".to_owned()))?;
 
-    let has_audio = document
-        .streams
-        .iter()
-        .any(|stream| stream.codec_type.as_deref() == Some("audio"));
-
     let video = choose_video_stream(&document.streams)
         .ok_or_else(|| AppError::InvalidMedia("文件中没有视频流".to_owned()))?;
     let coded_width = video
@@ -197,7 +354,6 @@ fn parse_probe_json(json: &[u8]) -> Result<MediaProbe> {
 
     Ok(MediaProbe {
         codec: parse_video_codec(video.codec_name.as_deref()),
-        has_audio,
         width,
         height,
         duration_seconds,
@@ -365,6 +521,114 @@ mod tests {
     use super::*;
 
     #[test]
+    fn configured_ffprobe_path_must_be_absolute() {
+        assert!(matches!(
+            resolve_ffprobe_path(Some(OsStr::new("bin/ffprobe")), None),
+            Err(AppError::Config(_))
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn path_candidates_skip_relative_directories() {
+        let search_path = env::join_paths([
+            PathBuf::from("relative/bin"),
+            PathBuf::from("."),
+            PathBuf::new(),
+            PathBuf::from("/trusted/media/bin"),
+        ])
+        .unwrap();
+
+        assert_eq!(
+            ffprobe_candidates(Some(&search_path)),
+            vec![PathBuf::from("/trusted/media/bin").join(FFPROBE_BINARY_NAME)]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn configured_ffprobe_is_canonicalized() {
+        let directory = TestDirectory::new();
+        let executable = directory.create_file("real-ffprobe", 0o700);
+        let configured = directory.path().join(FFPROBE_BINARY_NAME);
+        std::os::unix::fs::symlink(&executable, &configured).unwrap();
+
+        let resolved =
+            resolve_ffprobe_path(Some(configured.as_os_str()), None).expect("valid executable");
+
+        assert!(resolved.is_absolute());
+        assert_eq!(resolved, fs::canonicalize(executable).unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn configured_ffprobe_must_be_a_regular_executable_file() {
+        let directory = TestDirectory::new();
+        let non_executable = directory.create_file("not-executable", 0o600);
+        let writable_by_others = directory.create_file("writable-by-others", 0o722);
+
+        assert!(matches!(
+            resolve_ffprobe_path(Some(non_executable.as_os_str()), None),
+            Err(AppError::Config(_))
+        ));
+        assert!(matches!(
+            resolve_ffprobe_path(Some(directory.path().as_os_str()), None),
+            Err(AppError::Config(_))
+        ));
+        assert!(matches!(
+            resolve_ffprobe_path(Some(writable_by_others.as_os_str()), None),
+            Err(AppError::Config(_))
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn path_search_skips_invalid_files_and_returns_a_canonical_executable() {
+        let invalid_directory = TestDirectory::new();
+        invalid_directory.create_file(FFPROBE_BINARY_NAME, 0o600);
+        let valid_directory = TestDirectory::new();
+        let executable = valid_directory.create_file(FFPROBE_BINARY_NAME, 0o700);
+        let search_path = env::join_paths([invalid_directory.path(), valid_directory.path()])
+            .expect("valid test PATH");
+
+        let resolved =
+            resolve_ffprobe_path(None, Some(&search_path)).expect("PATH executable found");
+
+        assert_eq!(resolved, fs::canonicalize(executable).unwrap());
+    }
+
+    #[cfg(unix)]
+    struct TestDirectory(PathBuf);
+
+    #[cfg(unix)]
+    impl TestDirectory {
+        fn new() -> Self {
+            let path =
+                env::temp_dir().join(format!("parse-bot-ffprobe-test-{}", uuid::Uuid::new_v4()));
+            fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+
+        fn create_file(&self, name: &str, mode: u32) -> PathBuf {
+            let path = self.0.join(name);
+            fs::write(&path, b"test executable").unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(mode)).unwrap();
+            path
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for TestDirectory {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
     fn parses_video_audio_dimensions_codec_and_duration() {
         let json = br#"{
             "streams": [
@@ -383,7 +647,6 @@ mod tests {
 
         let probe = parse_probe_json(json).unwrap();
         assert_eq!(probe.codec, VideoCodec::H265);
-        assert!(probe.has_audio);
         assert_eq!((probe.width, probe.height), (1920, 1080));
         assert_eq!(probe.duration_seconds, Some(12.375));
     }
@@ -412,7 +675,6 @@ mod tests {
 
         let probe = parse_probe_json(json).unwrap();
         assert_eq!(probe.codec, VideoCodec::H264);
-        assert!(!probe.has_audio);
         assert_eq!((probe.width, probe.height), (720, 1280));
         assert_eq!(probe.duration_seconds, Some(3.5));
     }

@@ -6,7 +6,7 @@ use std::{
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     path::{Path, PathBuf},
     sync::{
-        Arc,
+        Arc, Mutex as StdMutex,
         atomic::{AtomicBool, Ordering},
     },
     time::Duration,
@@ -33,7 +33,10 @@ use crate::{
 const MAX_REDIRECTS: usize = 5;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(2 * 60 * 60);
+const DOWNLOAD_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 const DNS_TIMEOUT: Duration = Duration::from_secs(5);
+const MIN_FREE_DISK_BYTES: u64 = 512 * 1024 * 1024;
+const DISK_CHECK_INTERVAL_BYTES: u64 = 16 * 1024 * 1024;
 const CHANNELS_ORIGIN: &str = "https://channels.weixin.qq.com";
 const CHANNELS_REFERER: &str = "https://channels.weixin.qq.com/";
 const MEDIA_USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
@@ -94,6 +97,12 @@ pub struct MediaDownloader {
     max_bytes: u64,
     allowed_hosts: Arc<HashSet<String>>,
     request_timeout: Duration,
+    disk_write_budget: Arc<StdMutex<DiskWriteBudget>>,
+}
+
+#[derive(Debug, Default)]
+struct DiskWriteBudget {
+    unchecked_bytes: u64,
 }
 
 impl MediaDownloader {
@@ -136,6 +145,7 @@ impl MediaDownloader {
             max_bytes,
             allowed_hosts: Arc::new(allowed_hosts),
             request_timeout,
+            disk_write_budget: Arc::new(StdMutex::new(DiskWriteBudget::default())),
         })
     }
 
@@ -155,6 +165,7 @@ impl MediaDownloader {
             max_bytes: self.max_bytes.min(max_bytes),
             allowed_hosts: Arc::clone(&self.allowed_hosts),
             request_timeout: self.request_timeout,
+            disk_write_budget: Arc::clone(&self.disk_write_budget),
         })
     }
 
@@ -313,21 +324,34 @@ impl MediaDownloader {
         tokio::fs::create_dir_all(self.workspace_dir.as_path())
             .await
             .map_err(|_| AppError::Storage(self.workspace_dir.as_ref().clone()))?;
-
         let path = random_task_path(self.workspace_dir.as_path());
         let pending_file = create_private_file(path.clone()).await?;
         let (sender, mut receiver) = mpsc::channel(4);
         let writer_limit = self.max_bytes;
+        let disk_write_budget = Arc::clone(&self.disk_write_budget);
         let (progress_reporter, _progress_guard) =
             ProgressReporter::new(content_length, progress_callback);
 
         let writer = tokio::task::spawn_blocking(move || -> Result<WrittenMedia> {
-            write_chunks(pending_file, &mut receiver, writer_limit, progress_reporter)
+            write_chunks(
+                pending_file,
+                &mut receiver,
+                writer_limit,
+                progress_reporter,
+                disk_write_budget,
+            )
         });
 
         let mut streamed_bytes = 0_u64;
         let stream_result: Result<()> = async {
-            while let Some(chunk) = response.chunk().await.map_err(map_reqwest_download_error)? {
+            loop {
+                let chunk = timeout(DOWNLOAD_IDLE_TIMEOUT, response.chunk())
+                    .await
+                    .map_err(|_| AppError::Network("媒体响应读取超时".to_owned()))?
+                    .map_err(map_reqwest_download_error)?;
+                let Some(chunk) = chunk else {
+                    break;
+                };
                 streamed_bytes = streamed_bytes.checked_add(chunk.len() as u64).ok_or(
                     AppError::MediaTooLarge {
                         actual: u64::MAX,
@@ -343,7 +367,7 @@ impl MediaDownloader {
                 }
 
                 sender
-                    .send(chunk.to_vec())
+                    .send(chunk)
                     .await
                     .map_err(|_| AppError::Download("媒体文件写入失败".to_owned()))?;
             }
@@ -609,6 +633,45 @@ fn random_task_path(directory: &Path) -> PathBuf {
     directory.join(format!("{}.mp4", Uuid::new_v4().hyphenated()))
 }
 
+#[cfg(unix)]
+fn ensure_free_disk_space(directory: &Path, pending_write_bytes: u64) -> Result<()> {
+    use std::{ffi::CString, mem::MaybeUninit, os::unix::ffi::OsStrExt};
+
+    let path = CString::new(directory.as_os_str().as_bytes())
+        .map_err(|_| AppError::Storage(directory.to_owned()))?;
+    let mut statistics = MaybeUninit::<libc::statvfs>::uninit();
+    // SAFETY: `path` is NUL-terminated and `statistics` points to writable,
+    // correctly aligned storage. A successful call initializes the structure.
+    if unsafe { libc::statvfs(path.as_ptr(), statistics.as_mut_ptr()) } != 0 {
+        return Err(AppError::Storage(directory.to_owned()));
+    }
+    // SAFETY: statvfs returned success immediately above.
+    let statistics = unsafe { statistics.assume_init() };
+    let block_size = if statistics.f_frsize == 0 {
+        statistics.f_bsize
+    } else {
+        statistics.f_frsize
+    };
+    let available_bytes = u128::from(statistics.f_bavail) * u128::from(block_size);
+    if !disk_space_is_sufficient(available_bytes, pending_write_bytes) {
+        return Err(AppError::Storage(directory.to_owned()));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn disk_space_is_sufficient(available_bytes: u128, pending_write_bytes: u64) -> bool {
+    let required_bytes = u128::from(MIN_FREE_DISK_BYTES.saturating_add(pending_write_bytes));
+    available_bytes >= required_bytes
+}
+
+#[cfg(not(unix))]
+fn ensure_free_disk_space(_directory: &Path, _pending_write_bytes: u64) -> Result<()> {
+    // The supported deployment targets are Unix. Keep the write path portable;
+    // non-Unix deployments should enforce a volume quota externally.
+    Ok(())
+}
+
 async fn create_private_file(path: PathBuf) -> Result<PendingFile> {
     let storage_path = path.clone();
     tokio::task::spawn_blocking(move || {
@@ -626,15 +689,18 @@ async fn create_private_file(path: PathBuf) -> Result<PendingFile> {
     .map_err(|_| AppError::Storage(storage_path))
 }
 
-fn write_chunks(
+fn write_chunks<T: AsRef<[u8]>>(
     mut pending_file: PendingFile,
-    receiver: &mut mpsc::Receiver<Vec<u8>>,
+    receiver: &mut mpsc::Receiver<T>,
     max_bytes: u64,
     mut progress_reporter: Option<ProgressReporter>,
+    disk_write_budget: Arc<StdMutex<DiskWriteBudget>>,
 ) -> Result<WrittenMedia> {
     let mut bytes = 0_u64;
+    let mut checked_disk_space = false;
 
     while let Some(chunk) = receiver.blocking_recv() {
+        let chunk = chunk.as_ref();
         let next_bytes = bytes
             .checked_add(chunk.len() as u64)
             .ok_or(AppError::MediaTooLarge {
@@ -648,7 +714,32 @@ fn write_chunks(
             });
         }
 
-        pending_file.file_mut()?.write_all(&chunk)?;
+        let chunk_bytes = chunk.len() as u64;
+        let mut disk_budget = disk_write_budget
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let projected_bytes = disk_budget.unchecked_bytes.saturating_add(chunk_bytes);
+        if !checked_disk_space
+            || disk_budget.unchecked_bytes == 0
+            || projected_bytes > DISK_CHECK_INTERVAL_BYTES
+        {
+            ensure_free_disk_space(
+                pending_file
+                    .path
+                    .parent()
+                    .ok_or_else(|| AppError::Storage(pending_file.path.clone()))?,
+                DISK_CHECK_INTERVAL_BYTES.max(chunk_bytes),
+            )?;
+            disk_budget.unchecked_bytes = 0;
+            checked_disk_space = true;
+        }
+        pending_file.file_mut()?.write_all(chunk)?;
+        disk_budget.unchecked_bytes = if chunk_bytes >= DISK_CHECK_INTERVAL_BYTES {
+            0
+        } else {
+            disk_budget.unchecked_bytes.saturating_add(chunk_bytes)
+        };
+        drop(disk_budget);
         bytes = next_bytes;
         if let Some(reporter) = &mut progress_reporter {
             reporter.report_intermediate(bytes);
@@ -763,7 +854,6 @@ impl PendingFile {
     fn finish(mut self, bytes: u64) -> Result<DownloadedMedia> {
         let file = self.file_mut()?;
         file.flush()?;
-        file.sync_all()?;
         drop(self.file.take());
         self.armed = false;
         Ok(DownloadedMedia {
@@ -1046,6 +1136,17 @@ mod tests {
         assert!(is_forbidden_ip("::ffff:127.0.0.1".parse().unwrap()));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn preserves_disk_headroom_before_accepting_a_write() {
+        let reserve = u128::from(MIN_FREE_DISK_BYTES);
+
+        assert!(!disk_space_is_sufficient(reserve - 1, 0));
+        assert!(disk_space_is_sufficient(reserve, 0));
+        assert!(!disk_space_is_sufficient(reserve + 9, 10));
+        assert!(disk_space_is_sufficient(reserve + 10, 10));
+    }
+
     #[tokio::test]
     async fn cleanup_is_idempotent() {
         let directory = std::env::temp_dir().join(format!(
@@ -1095,7 +1196,9 @@ mod tests {
         sender.try_send(vec![7, 8]).unwrap();
         drop(sender);
 
-        let mut outcome = write_chunks(pending_file, &mut receiver, 8, reporter).unwrap();
+        let disk_write_budget = Arc::new(StdMutex::new(DiskWriteBudget::default()));
+        let mut outcome =
+            write_chunks(pending_file, &mut receiver, 8, reporter, disk_write_budget).unwrap();
         assert_eq!(
             std::fs::read(&outcome.media.path).unwrap(),
             (1_u8..=8).collect::<Vec<_>>()

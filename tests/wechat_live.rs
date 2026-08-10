@@ -1,9 +1,8 @@
-use std::{env, path::PathBuf};
+use std::{collections::HashSet, env, path::PathBuf, time::Duration};
 
 use parse_bot::{
     media::{MediaDownloader, decrypt_file_prefix, probe_media},
     model::{MediaSource, MediaSourceKind, ResolvedPost},
-    telegram::TELEGRAM_FILE_LIMIT_BYTES,
     wechat::WechatResolver,
 };
 use uuid::Uuid;
@@ -15,6 +14,8 @@ const ALLOWED_MEDIA_HOSTS: &[&str] = &[
     "finder.video.wechat.com",
     "findermp.video.wechat.com",
 ];
+const LIVE_DOWNLOAD_LIMIT_BYTES: u64 = 512 * 1024 * 1024;
+const LIVE_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(20 * 60);
 
 #[tokio::test]
 #[ignore = "requires WECHAT_YUANBAO_COOKIE and live Tencent endpoints"]
@@ -55,8 +56,17 @@ async fn resolves_wechat_channels_sample() {
 async fn downloads_decrypts_and_probes_wechat_channels_sample() {
     let post = resolve_sample().await;
     let directory = TestDirectory::new();
-    let downloader = MediaDownloader::new(directory.path(), TELEGRAM_FILE_LIMIT_BYTES)
-        .unwrap_or_else(|_| panic!("failed to initialize the live media downloader"));
+    let allowed_hosts = ALLOWED_MEDIA_HOSTS
+        .iter()
+        .map(|host| (*host).to_owned())
+        .collect::<HashSet<_>>();
+    let downloader = MediaDownloader::with_options(
+        directory.path(),
+        LIVE_DOWNLOAD_LIMIT_BYTES,
+        allowed_hosts,
+        LIVE_DOWNLOAD_TIMEOUT,
+    )
+    .unwrap_or_else(|_| panic!("failed to initialize the live media downloader"));
     let downloaded = downloader
         .download(&post.video)
         .await

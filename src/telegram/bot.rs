@@ -2443,7 +2443,6 @@ mod tests {
     fn uses_visible_dimensions_and_rounded_duration_for_telegram() {
         let probe = MediaProbe {
             codec: VideoCodec::H265,
-            has_audio: true,
             width: 1080,
             height: 1920,
             duration_seconds: Some(14.745),
