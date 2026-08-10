@@ -6,6 +6,7 @@ use parse_bot::{
     telegram::{BotService, TelegramClient},
     wechat::WechatResolver,
 };
+use tokio_util::sync::CancellationToken;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
@@ -42,15 +43,18 @@ async fn main() -> Result<()> {
         cache,
         config.required_channel_id,
         config.telegram_hard_limit_bytes,
-        config.callback_ttl,
     );
 
+    let shutdown = CancellationToken::new();
+    let run = bot.run(shutdown.clone());
+    tokio::pin!(run);
     tokio::select! {
-        result = bot.run() => result,
+        result = &mut run => result,
         signal = tokio::signal::ctrl_c() => {
             signal?;
             info!("收到退出信号");
-            Ok(())
+            shutdown.cancel();
+            run.await
         }
     }
 }

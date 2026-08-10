@@ -25,7 +25,6 @@ pub struct Config {
     pub telegram_hard_limit_bytes: u64,
     pub database_path: PathBuf,
     pub media_hosts: HashSet<String>,
-    pub callback_ttl: Duration,
 }
 
 impl Config {
@@ -83,7 +82,6 @@ impl Config {
 
         let wechat_resolve_timeout_secs = parse_u64("WECHAT_RESOLVE_TIMEOUT_SECS", 30)?;
         let wechat_download_timeout_secs = parse_u64("WECHAT_DOWNLOAD_TIMEOUT_SECS", 7_200)?;
-        let callback_ttl_secs = parse_u64("CALLBACK_TTL_SECS", 900)?;
         if wechat_resolve_timeout_secs > 300 {
             return Err(AppError::Config(
                 "WECHAT_RESOLVE_TIMEOUT_SECS 不能超过 300".into(),
@@ -94,10 +92,6 @@ impl Config {
                 "WECHAT_DOWNLOAD_TIMEOUT_SECS 不能超过 86400".into(),
             ));
         }
-        if callback_ttl_secs > 86_400 {
-            return Err(AppError::Config("CALLBACK_TTL_SECS 不能超过 86400".into()));
-        }
-
         Ok(Self {
             telegram_bot_token,
             telegram_api_url,
@@ -110,7 +104,6 @@ impl Config {
             telegram_hard_limit_bytes,
             database_path,
             media_hosts,
-            callback_ttl: Duration::from_secs(callback_ttl_secs),
         })
     }
 

@@ -185,7 +185,7 @@ impl TelegramClient {
             offset,
             limit: 100,
             timeout: timeout_secs,
-            allowed_updates: ["message", "callback_query"],
+            allowed_updates: ["message"],
         };
         let timeout =
             Duration::from_secs(u64::from(timeout_secs)).saturating_add(GET_UPDATES_GRACE);
@@ -1032,7 +1032,7 @@ struct GetUpdatesRequest<'a> {
     offset: Option<i64>,
     limit: u8,
     timeout: u32,
-    allowed_updates: [&'a str; 2],
+    allowed_updates: [&'a str; 1],
 }
 
 #[derive(Serialize)]
@@ -1153,6 +1153,20 @@ mod tests {
     }
 
     #[test]
+    fn long_polling_requests_only_message_updates() {
+        let request = GetUpdatesRequest {
+            offset: Some(101),
+            limit: 100,
+            timeout: 30,
+            allowed_updates: ["message"],
+        };
+        let value = serde_json::to_value(request).unwrap();
+
+        assert_eq!(value["offset"], 101);
+        assert_eq!(value["allowed_updates"], serde_json::json!(["message"]));
+    }
+
+    #[test]
     fn deserializes_private_text_reply_and_callback_update() {
         let json = r#"
         {
@@ -1165,7 +1179,7 @@ mod tests {
                 "date": 1720000000,
                 "chat": {"id": 42, "type": "private", "first_name": "A"},
                 "from": {"id": 42, "is_bot": false, "first_name": "A"},
-                "text": "/parse",
+                "text": "https://weixin.qq.com/sph/example",
                 "reply_to_message": {
                   "message_id": 10,
                   "date": 1719999999,
@@ -1239,7 +1253,7 @@ mod tests {
           "document": {
             "file_id": "document-file-id",
             "file_unique_id": "document-unique-id",
-            "file_name": "original.mp4",
+            "file_name": "video.mp4",
             "mime_type": "video/mp4",
             "file_size": 234567
           }
