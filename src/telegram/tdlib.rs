@@ -15,10 +15,10 @@ use parking_lot::Mutex as ParkingMutex;
 use tdlib_rs::{
     enums::{
         AuthorizationState, BotCommandScope, ButtonStyle, CallbackQueryPayload,
-        ChatMemberStatus as TdChatMemberStatus, ChatType, FormattedText as TdFormattedText,
-        InlineKeyboardButtonType, InputFile as TdInputFile, InputMessageContent,
-        InputMessageReplyTo, Message as TdMessage, MessageContent, MessageSender, ReplyMarkup,
-        TextParseMode, Update as TdUpdate, User as TdUser, UserType,
+        ChatMemberStatus as TdChatMemberStatus, ChatType, ConnectionState,
+        FormattedText as TdFormattedText, InlineKeyboardButtonType, InputFile as TdInputFile,
+        InputMessageContent, InputMessageReplyTo, Message as TdMessage, MessageContent,
+        MessageSender, ReplyMarkup, TextParseMode, Update as TdUpdate, User as TdUser, UserType,
     },
     functions,
     types::{
@@ -33,6 +33,7 @@ use tokio::{
     sync::{Mutex, Notify, mpsc, oneshot},
     task::JoinHandle,
 };
+use tracing::info;
 use uuid::Uuid;
 
 use crate::media::{DownloadedMedia, MediaDownloader};
@@ -1267,7 +1268,7 @@ impl TelegramClient {
                     .download_url(url)
                     .await
                     .map_err(|error| TelegramError::runtime("download cover", error.to_string()))?;
-                give_cover_image_extension(&mut temporary, url).await?;
+                give_cover_image_extension(&mut temporary).await?;
                 let input = TdInputFile::Local(InputFileLocal {
                     path: path_to_string(&temporary.path)?,
                 });
@@ -1550,6 +1551,7 @@ fn spawn_receive_pump(pump: ReceivePump) -> JoinHandle<()> {
             }
 
             match update {
+                TdUpdate::ConnectionState(update) => log_connection_state(&update.state),
                 TdUpdate::MessageSendSucceeded(update) => pump.send_tracker.complete(
                     (update.message.chat_id, update.old_message_id),
                     SendOutcome::Succeeded(Box::new(update.message)),
@@ -1627,6 +1629,26 @@ fn spawn_receive_pump(pump: ReceivePump) -> JoinHandle<()> {
             }
         }
     })
+}
+
+fn log_connection_state(state: &ConnectionState) {
+    let (state_code, description) = connection_state_description(state);
+    info!(
+        event = "telegram_connection_state",
+        state = state_code,
+        description,
+        "Telegram 连接状态已更新"
+    );
+}
+
+fn connection_state_description(state: &ConnectionState) -> (&'static str, &'static str) {
+    match state {
+        ConnectionState::WaitingForNetwork => ("waiting_for_network", "等待网络可用"),
+        ConnectionState::ConnectingToProxy => ("connecting_to_proxy", "正在连接代理服务器"),
+        ConnectionState::Connecting => ("connecting", "正在连接 Telegram"),
+        ConnectionState::Updating => ("updating", "正在同步离线期间的数据"),
+        ConnectionState::Ready => ("ready", "Telegram 连接已就绪"),
+    }
 }
 
 fn try_dispatch_update(
@@ -1792,39 +1814,29 @@ async fn create_upload_lease(source: &Path) -> TelegramResult<PathBuf> {
     Ok(lease_path)
 }
 
-async fn give_cover_image_extension(
-    downloaded: &mut DownloadedMedia,
-    url: &url::Url,
-) -> TelegramResult<()> {
-    let url_extension = Path::new(url.path())
-        .extension()
-        .and_then(|value| value.to_str())
-        .map(str::to_ascii_lowercase)
-        .filter(|value| matches!(value.as_str(), "jpg" | "jpeg" | "png" | "webp"));
-    let extension = match url_extension {
-        Some(extension) => extension,
-        None => {
-            let mut file = tokio::fs::File::open(&downloaded.path)
-                .await
-                .map_err(|error| TelegramError::runtime("inspect cover", error.to_string()))?;
-            let mut header = [0_u8; 16];
-            let length = file
-                .read(&mut header)
-                .await
-                .map_err(|error| TelegramError::runtime("inspect cover", error.to_string()))?;
-            if length >= 3 && header[..3] == [0xff, 0xd8, 0xff] {
-                "jpg".to_owned()
-            } else if length >= 8 && header[..8] == *b"\x89PNG\r\n\x1a\n" {
-                "png".to_owned()
-            } else if length >= 12 && header[..4] == *b"RIFF" && header[8..12] == *b"WEBP" {
-                "webp".to_owned()
-            } else {
-                return Err(TelegramError::InvalidInputFile {
-                    reason: "downloaded video cover is not a supported image",
-                });
-            }
-        }
+async fn give_cover_image_extension(downloaded: &mut DownloadedMedia) -> TelegramResult<()> {
+    // A signed URL can return an HTML error body while retaining a `.jpg`
+    // suffix. Inspect the downloaded bytes instead of trusting that suffix.
+    let mut file = tokio::fs::File::open(&downloaded.path)
+        .await
+        .map_err(|error| TelegramError::runtime("inspect cover", error.to_string()))?;
+    let mut header = [0_u8; 16];
+    let length = file
+        .read(&mut header)
+        .await
+        .map_err(|error| TelegramError::runtime("inspect cover", error.to_string()))?;
+    let extension = if length >= 3 && header[..3] == [0xff, 0xd8, 0xff] {
+        "jpg"
+    } else if length >= 8 && header[..8] == *b"\x89PNG\r\n\x1a\n" {
+        "png"
+    } else if length >= 12 && header[..4] == *b"RIFF" && header[8..12] == *b"WEBP" {
+        "webp"
+    } else {
+        return Err(TelegramError::InvalidInputFile {
+            reason: "downloaded video cover is not a supported image",
+        });
     };
+    drop(file);
 
     let image_path = downloaded.path.with_extension(extension);
     tokio::fs::rename(&downloaded.path, &image_path)
@@ -1845,6 +1857,30 @@ fn path_to_string(path: &Path) -> TelegramResult<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn describes_every_tdlib_connection_state_without_debug_payloads() {
+        assert_eq!(
+            connection_state_description(&ConnectionState::WaitingForNetwork),
+            ("waiting_for_network", "等待网络可用")
+        );
+        assert_eq!(
+            connection_state_description(&ConnectionState::ConnectingToProxy),
+            ("connecting_to_proxy", "正在连接代理服务器")
+        );
+        assert_eq!(
+            connection_state_description(&ConnectionState::Connecting),
+            ("connecting", "正在连接 Telegram")
+        );
+        assert_eq!(
+            connection_state_description(&ConnectionState::Updating),
+            ("updating", "正在同步离线期间的数据")
+        );
+        assert_eq!(
+            connection_state_description(&ConnectionState::Ready),
+            ("ready", "Telegram 连接已就绪")
+        );
+    }
 
     #[test]
     fn callback_data_round_trips_through_tdlib_base64() {
@@ -1933,6 +1969,46 @@ mod tests {
         };
         drop(prepared);
         assert!(!lease_path.exists());
+        tokio::fs::remove_dir_all(directory).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cover_detection_uses_bytes_instead_of_a_trusted_url_suffix() {
+        let directory = std::env::temp_dir().join(format!(
+            "parse-bot-tdlib-cover-test-{}",
+            Uuid::new_v4().hyphenated()
+        ));
+        tokio::fs::create_dir_all(&directory).await.unwrap();
+
+        let fake_jpeg_path = directory.join("signed-cover.jpg");
+        tokio::fs::write(&fake_jpeg_path, b"<html>expired</html>")
+            .await
+            .unwrap();
+        let mut fake_jpeg = DownloadedMedia {
+            path: fake_jpeg_path,
+            bytes: 20,
+        };
+        assert!(matches!(
+            give_cover_image_extension(&mut fake_jpeg).await,
+            Err(TelegramError::InvalidInputFile { .. })
+        ));
+
+        let real_jpeg_path = directory.join("signed-cover.png");
+        tokio::fs::write(&real_jpeg_path, b"\xff\xd8\xffjpeg")
+            .await
+            .unwrap();
+        let mut real_jpeg = DownloadedMedia {
+            path: real_jpeg_path,
+            bytes: 7,
+        };
+        give_cover_image_extension(&mut real_jpeg).await.unwrap();
+        assert_eq!(
+            real_jpeg.path.extension().and_then(|value| value.to_str()),
+            Some("jpg")
+        );
+
+        drop(fake_jpeg);
+        drop(real_jpeg);
         tokio::fs::remove_dir_all(directory).await.unwrap();
     }
 

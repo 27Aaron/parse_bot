@@ -77,6 +77,43 @@ impl TelegramError {
         matches!(self.error_code(), Some(420 | 429)) || self.retry_after().is_some()
     }
 
+    /// Returns whether retrying the same video without its optional cover can
+    /// make progress. Generic edit failures and rate limits must not trigger a
+    /// second upload of the main media file.
+    pub fn is_cover_failure(&self) -> bool {
+        match self {
+            Self::Runtime { operation, .. } => {
+                matches!(
+                    *operation,
+                    "download cover" | "inspect cover" | "prepare cover"
+                )
+            }
+            Self::InvalidInputFile { reason } => reason.to_ascii_lowercase().contains("cover"),
+            Self::Api {
+                error_code: Some(400),
+                description,
+                ..
+            } => {
+                let description = description.to_ascii_uppercase();
+                [
+                    "COVER",
+                    "THUMBNAIL",
+                    "WEBPAGE_CURL_FAILED",
+                    "WEBPAGE_MEDIA_EMPTY",
+                    "PHOTO_INVALID_DIMENSIONS",
+                    "PHOTO_EXT_INVALID",
+                    "PHOTO_CONTENT_TYPE_INVALID",
+                    "PHOTO_INVALID",
+                    "PHOTO_SAVE_FILE_INVALID",
+                    "IMAGE_PROCESS_FAILED",
+                ]
+                .iter()
+                .any(|marker| description.contains(marker))
+            }
+            _ => false,
+        }
+    }
+
     pub fn is_terminal(&self) -> bool {
         matches!(
             self,
@@ -494,6 +531,54 @@ mod tests {
         assert!(TelegramError::Closed.is_terminal());
         assert!(TelegramError::runtime("receive", "pump stopped").is_terminal());
         assert!(!TelegramError::runtime("sendMessage", "temporary failure").is_terminal());
+    }
+
+    #[test]
+    fn retries_without_cover_only_for_cover_specific_failures() {
+        assert!(TelegramError::runtime("download cover", "temporary failure").is_cover_failure());
+        assert!(
+            TelegramError::InvalidInputFile {
+                reason: "downloaded video cover is not a supported image"
+            }
+            .is_cover_failure()
+        );
+        assert!(
+            TelegramError::Api {
+                method: "editMessageMedia",
+                error_code: Some(400),
+                description: "WEBPAGE_MEDIA_EMPTY".into(),
+                retry_after: None,
+            }
+            .is_cover_failure()
+        );
+        assert!(
+            TelegramError::Api {
+                method: "editMessageMedia",
+                error_code: Some(400),
+                description: "PHOTO_INVALID_DIMENSIONS".into(),
+                retry_after: None,
+            }
+            .is_cover_failure()
+        );
+
+        for error in [
+            TelegramError::Api {
+                method: "editMessageMedia",
+                error_code: Some(400),
+                description: "MESSAGE_NOT_MODIFIED".into(),
+                retry_after: None,
+            },
+            TelegramError::Api {
+                method: "editMessageMedia",
+                error_code: Some(429),
+                description: "cover flood wait".into(),
+                retry_after: Some(Duration::from_secs(5)),
+            },
+            TelegramError::runtime("editMessageMedia", "temporary failure"),
+            TelegramError::Closed,
+        ] {
+            assert!(!error.is_cover_failure(), "unexpected cover retry: {error}");
+        }
     }
 
     #[test]
