@@ -54,12 +54,6 @@ pub enum AppError {
 
     #[error(transparent)]
     Io(#[from] std::io::Error),
-
-    #[error(transparent)]
-    Json(#[from] serde_json::Error),
-
-    #[error(transparent)]
-    Url(#[from] url::ParseError),
 }
 
 impl AppError {
@@ -181,7 +175,7 @@ impl AppError {
                 Language::Japanese => "タスクをキャンセルしました。".into(),
                 Language::Russian => "Задача отменена.".into(),
             },
-            (_, Self::Database(_) | Self::Io(_) | Self::Json(_) | Self::Url(_)) => match language {
+            (_, Self::Database(_) | Self::Io(_)) => match language {
                 Language::Chinese => "处理失败，请稍后重试".into(),
                 Language::English => "Processing failed. Please try again later.".into(),
                 Language::Japanese => "処理に失敗しました。後でもう一度お試しください。".into(),
@@ -193,4 +187,4 @@ impl AppError {
     }
 }
 
-pub type Result<T, E = AppError> = std::result::Result<T, E>;
+pub type Result<T> = std::result::Result<T, AppError>;

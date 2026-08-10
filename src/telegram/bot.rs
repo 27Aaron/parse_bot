@@ -1,12 +1,14 @@
 use std::{
     collections::{HashMap, VecDeque},
     panic::AssertUnwindSafe,
-    sync::{Arc, Mutex as StdMutex, OnceLock, Weak},
+    sync::{
+        Arc, Mutex as StdMutex, Weak,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{Duration, Instant},
 };
 
 use futures_util::FutureExt;
-use regex::{Captures, Regex};
 use tokio::{
     sync::{Mutex, OwnedMutexGuard, Semaphore, mpsc},
     task::AbortHandle,
@@ -35,8 +37,19 @@ const COMMAND_CONFIGURATION_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_ACTIVE_TASKS: usize = 10;
 const MAX_WAITING_TASKS_PER_USER: usize = 3;
 const MAX_WAITING_TASKS: usize = 100;
-const MEDIA_PIPELINE_CONCURRENCY: usize = MAX_ACTIVE_TASKS;
-const INBOUND_LOG_PREVIEW_CHARS: usize = 240;
+// Resolving and scheduling are cheap, but every active media pipeline may keep
+// a file as large as Telegram's 2 GiB limit on disk. Keep this budget separate
+// from the workflow scheduler so ten active users cannot reserve ~20 GiB.
+const MEDIA_PIPELINE_CONCURRENCY: usize = 2;
+const MAX_UPDATE_WORKERS: usize = 64;
+const UPDATE_QUEUE_PER_USER: usize = 16;
+static USER_QUEUE_DROPPED_UPDATES: AtomicU64 = AtomicU64::new(0);
+static WORKER_LIMIT_DROPPED_UPDATES: AtomicU64 = AtomicU64::new(0);
+
+fn sampled_drop_count(counter: &AtomicU64) -> Option<u64> {
+    let count = counter.fetch_add(1, Ordering::Relaxed).saturating_add(1);
+    (count == 1 || count.is_multiple_of(1_000)).then_some(count)
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct MediaFlightKey {
@@ -88,6 +101,35 @@ struct MediaFlight {
     lock: Arc<Mutex<()>>,
 }
 
+struct UpdateWorkerEntry {
+    generation: u64,
+    sender: mpsc::Sender<Update>,
+}
+
+struct UpdateDispatcher {
+    workers: StdMutex<HashMap<u64, UpdateWorkerEntry>>,
+    slots: Arc<Semaphore>,
+    next_generation: AtomicU64,
+}
+
+impl UpdateDispatcher {
+    fn new() -> Self {
+        Self {
+            workers: StdMutex::new(HashMap::new()),
+            slots: Arc::new(Semaphore::new(MAX_UPDATE_WORKERS)),
+            next_generation: AtomicU64::new(1),
+        }
+    }
+}
+
+fn update_user_id(update: &Update) -> Option<u64> {
+    update
+        .callback_query
+        .as_ref()
+        .map(|callback| callback.sender.id)
+        .or_else(|| update.message.as_ref().and_then(Message::sender_id))
+}
+
 impl MediaFlight {
     fn try_acquire(&self) -> Option<OwnedMutexGuard<()>> {
         self.lock.clone().try_lock_owned().ok()
@@ -106,18 +148,12 @@ fn log_inbound_update(update: &Update) {
     if let Some(callback) = update.callback_query.as_ref() {
         let message = callback.message.as_ref();
         let callback_action = callback.data.as_deref().and_then(safe_callback_action);
-        let username = callback
-            .sender
-            .username
-            .as_deref()
-            .map(sanitize_inbound_log_preview);
         info!(
             event = "telegram_inbound",
             update_kind = "callback_query",
             user_id = callback.sender.id,
             chat_id = ?message.map(|message| message.chat.id),
             message_id = ?message.map(|message| message.message_id),
-            username = ?username.as_deref(),
             callback_action = ?callback_action,
             "收到 Telegram 回调"
         );
@@ -133,14 +169,8 @@ fn log_inbound_update(update: &Update) {
         return;
     };
     let user_id = message.sender_id();
-    let username = message
-        .sender
-        .as_ref()
-        .and_then(|sender| sender.username.as_deref())
-        .map(sanitize_inbound_log_preview);
 
     if let Some(text) = message.text.as_deref() {
-        let text = sanitize_inbound_log_preview(text);
         info!(
             event = "telegram_inbound",
             update_kind = "message",
@@ -148,26 +178,19 @@ fn log_inbound_update(update: &Update) {
             user_id = ?user_id,
             chat_id = message.chat.id,
             message_id = message.message_id,
-            username = ?username.as_deref(),
-            text = %text,
+            characters = text.chars().count(),
             "收到 Telegram 文本消息"
         );
         return;
     }
 
-    let (content_kind, mime_type, file_size) = if let Some(video) = message.video.as_ref() {
-        ("video", video.mime_type.as_deref(), video.file_size)
+    let (content_kind, file_size) = if let Some(video) = message.video.as_ref() {
+        ("video", video.file_size)
     } else if let Some(document) = message.document.as_ref() {
-        (
-            "document",
-            document.mime_type.as_deref(),
-            document.file_size,
-        )
+        ("document", document.file_size)
     } else {
-        ("other", None, None)
+        ("other", None)
     };
-    let mime_type = mime_type.map(sanitize_inbound_log_preview);
-    let caption = message.caption.as_deref().map(sanitize_inbound_log_preview);
     info!(
         event = "telegram_inbound",
         update_kind = "message",
@@ -175,134 +198,10 @@ fn log_inbound_update(update: &Update) {
         user_id = ?user_id,
         chat_id = message.chat.id,
         message_id = message.message_id,
-        username = ?username.as_deref(),
-        mime_type = ?mime_type.as_deref(),
         file_size = ?file_size,
-        caption = ?caption.as_deref(),
+        has_caption = message.caption.is_some(),
         "收到 Telegram 非文本消息"
     );
-}
-
-fn sanitize_inbound_log_preview(value: &str) -> String {
-    static BOT_TOKEN_PATTERN: OnceLock<Regex> = OnceLock::new();
-    static LINE_SECRET_PATTERN: OnceLock<Regex> = OnceLock::new();
-    static TOKEN_ASSIGNMENT_PATTERN: OnceLock<Regex> = OnceLock::new();
-    static BEARER_PATTERN: OnceLock<Regex> = OnceLock::new();
-    static URL_PATTERN: OnceLock<Regex> = OnceLock::new();
-    static OPAQUE_ID_PATTERN: OnceLock<Regex> = OnceLock::new();
-
-    let bot_token_pattern = BOT_TOKEN_PATTERN.get_or_init(|| {
-        Regex::new(r"\d{5,}:[A-Za-z0-9_-]{20,}")
-            .expect("the Telegram Bot Token regex is a constant")
-    });
-    let line_secret_pattern = LINE_SECRET_PATTERN.get_or_init(|| {
-        Regex::new(
-            r"(?im)\b([a-z0-9_-]*(?:authorization|cookie|password|passwd))\s*([:=])\s*[^\r\n]*",
-        )
-        .expect("the line secret regex is a constant")
-    });
-    let token_assignment_pattern = TOKEN_ASSIGNMENT_PATTERN.get_or_init(|| {
-        Regex::new(
-            r#"(?i)\b([a-z0-9_-]*(?:bot[_-]?token|access[_-]?token|token|api[_-]?(?:hash|key)))\s*([:=])\s*(?:"[^"\r\n]*"|'[^'\r\n]*'|[^\s,;]+)"#,
-        )
-        .expect("the token assignment regex is a constant")
-    });
-    let bearer_pattern = BEARER_PATTERN.get_or_init(|| {
-        Regex::new(r"(?i)\b(bearer)\s+[^\s,;]+").expect("the bearer credential regex is a constant")
-    });
-    let url_pattern = URL_PATTERN.get_or_init(|| {
-        Regex::new(r#"(?i)\b(?:https?|tg)://[^\s<>"']+"#)
-            .expect("the inbound URL regex is a constant")
-    });
-    let opaque_id_pattern = OPAQUE_ID_PATTERN.get_or_init(|| {
-        Regex::new(r"\b[A-Za-z0-9_-]{64,}\b").expect("the opaque identifier regex is a constant")
-    });
-
-    let safe_value = value
-        .chars()
-        .filter(|character| !is_unsafe_log_format_control(*character))
-        .map(|character| {
-            if character.is_control() && !matches!(character, '\r' | '\n') {
-                ' '
-            } else {
-                character
-            }
-        })
-        .collect::<String>();
-
-    // Redact URL suffixes before inserting angle-bracket placeholders; those
-    // placeholders deliberately terminate the URL matcher.
-    let redacted = url_pattern.replace_all(&safe_value, |captures: &Captures<'_>| {
-        sanitize_inbound_url(&captures[0])
-    });
-    let redacted = bot_token_pattern.replace_all(&redacted, "<redacted-bot-token>");
-    let redacted = line_secret_pattern.replace_all(&redacted, "$1$2<redacted>");
-    let redacted = token_assignment_pattern.replace_all(&redacted, "$1$2<redacted>");
-    let redacted = bearer_pattern.replace_all(&redacted, "$1 <redacted>");
-    let redacted = opaque_id_pattern.replace_all(&redacted, "<redacted-id>");
-
-    let mut single_line = String::with_capacity(redacted.len().min(INBOUND_LOG_PREVIEW_CHARS));
-    let mut pending_space = false;
-    for character in redacted.chars() {
-        if character.is_whitespace() || character.is_control() {
-            pending_space = !single_line.is_empty();
-            continue;
-        }
-        if pending_space {
-            single_line.push(' ');
-            pending_space = false;
-        }
-        single_line.push(character);
-    }
-
-    if single_line.chars().count() <= INBOUND_LOG_PREVIEW_CHARS {
-        return single_line;
-    }
-    let mut preview = single_line
-        .chars()
-        .take(INBOUND_LOG_PREVIEW_CHARS - 1)
-        .collect::<String>();
-    preview.push('…');
-    preview
-}
-
-fn is_unsafe_log_format_control(character: char) -> bool {
-    matches!(
-        character,
-        '\u{061c}'
-            | '\u{200b}'..='\u{200f}'
-            | '\u{202a}'..='\u{202e}'
-            | '\u{2060}'..='\u{206f}'
-            | '\u{feff}'
-    )
-}
-
-fn sanitize_inbound_url(value: &str) -> String {
-    let Ok(mut url) = url::Url::parse(value) else {
-        let secret_start = value.find(['?', '#']);
-        return secret_start.map_or_else(
-            || "<redacted-url>".to_owned(),
-            |index| format!("{}?<redacted>", &value[..index]),
-        );
-    };
-    let had_credentials = !url.username().is_empty() || url.password().is_some();
-    let had_query = url.query().is_some();
-    let had_fragment = url.fragment().is_some();
-    if !had_credentials && !had_query && !had_fragment {
-        return value.to_owned();
-    }
-
-    if had_credentials {
-        let _ = url.set_username("");
-        let _ = url.set_password(None);
-    }
-    url.set_query(None);
-    url.set_fragment(None);
-    let mut sanitized = url.to_string();
-    if had_query || had_fragment {
-        sanitized.push_str("?<redacted>");
-    }
-    sanitized
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -386,37 +285,16 @@ pub struct BotService {
     scheduler: Arc<Mutex<SchedulerState>>,
     media_slots: Arc<Semaphore>,
     media_flights: Arc<MediaFlightLocks>,
+    update_dispatcher: Arc<UpdateDispatcher>,
     background_tasks: TaskTracker,
     task_abort_handles: Arc<StdMutex<Vec<AbortHandle>>>,
 }
 
-#[derive(Clone)]
 struct MediaTask {
     chat_id: i64,
     status_message_id: i64,
-    post: Arc<ResolvedPost>,
-    preferences: UserPreferences,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct UserPreferences {
-    language: Language,
-    show_source: bool,
-    show_progress: bool,
-    reply_to_source: bool,
-    show_video_cover: bool,
-}
-
-impl From<UserSettings> for UserPreferences {
-    fn from(settings: UserSettings) -> Self {
-        Self {
-            language: settings.language,
-            show_source: settings.show_source,
-            show_progress: settings.show_progress,
-            reply_to_source: settings.reply_to_source,
-            show_video_cover: settings.show_video_cover,
-        }
-    }
+    post: ResolvedPost,
+    preferences: UserSettings,
 }
 
 struct ParseTask {
@@ -427,7 +305,7 @@ struct ParseTask {
     share_url: url::Url,
     status_message_id: Option<i64>,
     cancellation: CancellationToken,
-    preferences: UserPreferences,
+    preferences: UserSettings,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -708,6 +586,7 @@ impl BotService {
             scheduler: Arc::new(Mutex::new(SchedulerState::new())),
             media_slots: Arc::new(Semaphore::new(MEDIA_PIPELINE_CONCURRENCY)),
             media_flights: Arc::new(MediaFlightLocks::default()),
+            update_dispatcher: Arc::new(UpdateDispatcher::new()),
             background_tasks: TaskTracker::new(),
             task_abort_handles: Arc::new(StdMutex::new(Vec::new())),
         }
@@ -731,9 +610,8 @@ impl BotService {
             };
             match update {
                 Ok(update) => {
-                    if let Err(error) = self.handle_update(update, &shutdown).await {
-                        error!(error = %error, "处理 Telegram update 失败");
-                    }
+                    log_inbound_update(&update);
+                    self.dispatch_update(update, &shutdown);
                 }
                 Err(error) if error.is_terminal() => {
                     shutdown.cancel();
@@ -792,8 +670,133 @@ impl BotService {
         }
     }
 
+    fn dispatch_update(&self, mut update: Update, shutdown: &CancellationToken) {
+        let Some(user_id) = update_user_id(&update) else {
+            return;
+        };
+        let mut workers = self
+            .update_dispatcher
+            .workers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(worker) = workers.get(&user_id) {
+            match worker.sender.try_send(update) {
+                Ok(()) => return,
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    if let Some(dropped_total) = sampled_drop_count(&USER_QUEUE_DROPPED_UPDATES) {
+                        warn!(
+                            event = "telegram_update_dropped",
+                            user_id,
+                            reason = "user_queue_full",
+                            dropped_total,
+                            "用户 update 队列已满，丢弃本次 update"
+                        );
+                    }
+                    return;
+                }
+                Err(mpsc::error::TrySendError::Closed(error)) => {
+                    update = error;
+                    workers.remove(&user_id);
+                }
+            }
+        }
+
+        let Ok(permit) = self.update_dispatcher.slots.clone().try_acquire_owned() else {
+            if let Some(dropped_total) = sampled_drop_count(&WORKER_LIMIT_DROPPED_UPDATES) {
+                warn!(
+                    event = "telegram_update_dropped",
+                    user_id,
+                    reason = "worker_limit",
+                    dropped_total,
+                    "活跃 update 用户数已达上限，丢弃本次 update"
+                );
+            }
+            return;
+        };
+        let generation = self
+            .update_dispatcher
+            .next_generation
+            .fetch_add(1, Ordering::Relaxed);
+        let (sender, receiver) = mpsc::channel(UPDATE_QUEUE_PER_USER);
+        // A fresh bounded channel always has room for its first item.
+        sender
+            .try_send(update)
+            .expect("a new update worker channel has capacity");
+        workers.insert(user_id, UpdateWorkerEntry { generation, sender });
+        drop(workers);
+
+        let service = self.clone();
+        let shutdown = shutdown.clone();
+        let span = info_span!("update_worker", user_id, generation);
+        let handle = self.background_tasks.spawn(
+            async move {
+                service
+                    .run_update_worker(user_id, generation, receiver, permit, shutdown)
+                    .await;
+            }
+            .instrument(span),
+        );
+        drop(handle);
+    }
+
+    async fn run_update_worker(
+        &self,
+        user_id: u64,
+        generation: u64,
+        mut receiver: mpsc::Receiver<Update>,
+        _permit: tokio::sync::OwnedSemaphorePermit,
+        shutdown: CancellationToken,
+    ) {
+        loop {
+            let update = tokio::select! {
+                biased;
+                _ = shutdown.cancelled() => break,
+                update = receiver.recv() => match update {
+                    Some(update) => update,
+                    None => break,
+                },
+            };
+
+            let result = tokio::select! {
+                biased;
+                _ = shutdown.cancelled() => break,
+                result = AssertUnwindSafe(self.handle_update(update, &shutdown)).catch_unwind() => result,
+            };
+            match result {
+                Ok(Ok(())) => {}
+                Ok(Err(AppError::Cancelled)) if shutdown.is_cancelled() => break,
+                Ok(Err(error)) => error!(error = %error, "处理 Telegram update 失败"),
+                Err(_) => error!("处理 Telegram update 时 panic，继续消费该用户队列"),
+            }
+
+            let mut workers = self
+                .update_dispatcher
+                .workers
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let is_current = workers
+                .get(&user_id)
+                .is_some_and(|worker| worker.generation == generation);
+            if is_current && receiver.is_empty() {
+                workers.remove(&user_id);
+                break;
+            }
+        }
+
+        let mut workers = self
+            .update_dispatcher
+            .workers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if workers
+            .get(&user_id)
+            .is_some_and(|worker| worker.generation == generation)
+        {
+            workers.remove(&user_id);
+        }
+    }
+
     async fn handle_update(&self, update: Update, shutdown: &CancellationToken) -> Result<()> {
-        log_inbound_update(&update);
         if let Some(callback) = update.callback_query {
             return self.handle_callback(callback, shutdown).await;
         }
@@ -811,19 +814,16 @@ impl BotService {
         callback: CallbackQuery,
         shutdown: &CancellationToken,
     ) -> Result<()> {
-        let default_language = Language::Chinese;
         let callback_language =
             Language::from_telegram_code(callback.sender.language_code.as_deref());
-        let preferences = UserPreferences::from(
-            self.cache
-                .get_user_settings_with_default(callback.sender.id, callback_language)
-                .await
-                .unwrap_or_default(),
-        );
+        let mut settings = self
+            .cache
+            .get_user_settings_with_default(callback.sender.id, callback_language)
+            .await?;
         let Some(message) = callback.message.as_ref() else {
             self.answer_callback(
                 &callback.id,
-                Some(i18n::invalid_setting(default_language)),
+                Some(i18n::invalid_setting(settings.language)),
                 true,
             )
             .await;
@@ -832,7 +832,7 @@ impl BotService {
         if !message.chat.is_private() {
             self.answer_callback(
                 &callback.id,
-                Some(i18n::only_private_settings(preferences.language)),
+                Some(i18n::only_private_settings(settings.language)),
                 true,
             )
             .await;
@@ -842,7 +842,7 @@ impl BotService {
         else {
             self.answer_callback(
                 &callback.id,
-                Some(i18n::invalid_setting(preferences.language)),
+                Some(i18n::invalid_setting(settings.language)),
                 true,
             )
             .await;
@@ -851,18 +851,12 @@ impl BotService {
         if !setting_callback.is_owned_by(callback.sender.id) {
             self.answer_callback(
                 &callback.id,
-                Some(i18n::invalid_setting(preferences.language)),
+                Some(i18n::invalid_setting(settings.language)),
                 true,
             )
             .await;
             return Ok(());
         }
-
-        let mut settings = self
-            .cache
-            .get_user_settings_with_default(callback.sender.id, callback_language)
-            .await
-            .unwrap_or_default();
         let mut notice = None;
         match setting_callback.action {
             SettingAction::Main => {}
@@ -955,9 +949,7 @@ impl BotService {
             }
         }
 
-        let preferences = UserPreferences::from(settings);
-        let (panel, keyboard) =
-            settings_panel(preferences.language, preferences, callback.sender.id);
+        let (panel, keyboard) = settings_panel(settings.language, settings, callback.sender.id);
         let result = tokio::select! {
             _ = shutdown.cancelled() => return Ok(()),
             result = self.telegram.edit_message_text_html(
@@ -984,7 +976,7 @@ impl BotService {
         chat_id: i64,
         text: &str,
         source_message_id: i64,
-        preferences: UserPreferences,
+        preferences: UserSettings,
     ) -> std::result::Result<Message, TelegramError> {
         if preferences.reply_to_source {
             self.telegram
@@ -1000,7 +992,7 @@ impl BotService {
         chat_id: i64,
         text: &str,
         source_message_id: i64,
-        preferences: UserPreferences,
+        preferences: UserSettings,
         reply_markup: Option<&InlineKeyboardMarkup>,
     ) -> std::result::Result<Message, TelegramError> {
         if preferences.reply_to_source {
@@ -1024,11 +1016,10 @@ impl BotService {
                 .as_ref()
                 .and_then(|user| user.language_code.as_deref()),
         );
-        let preferences = UserPreferences::from(
-            self.cache
-                .get_user_settings_with_default(user_id, telegram_language)
-                .await?,
-        );
+        let preferences = self
+            .cache
+            .get_user_settings_with_default(user_id, telegram_language)
+            .await?;
         let chat_id = message.chat.id;
         if !message.chat.is_private() {
             tokio::select! {
@@ -1112,7 +1103,7 @@ impl BotService {
         user_id: u64,
         source_message_id: i64,
         input: String,
-        preferences: UserPreferences,
+        preferences: UserSettings,
         shutdown: &CancellationToken,
     ) -> Result<()> {
         let share_url = match extract_share_url(&input) {
@@ -1398,7 +1389,7 @@ impl BotService {
         };
 
         let post = match resolved {
-            Ok(post) => Arc::new(post),
+            Ok(post) => post,
             Err(error) => {
                 self.edit_error_status(
                     task.chat_id,
@@ -1518,7 +1509,6 @@ impl BotService {
             break guard;
         };
 
-        let mut source = task.post.video.clone();
         let _permit = tokio::select! {
             _ = cancellation.cancelled() => return Err(AppError::Cancelled),
             permit = self.media_slots.acquire() => permit.map_err(|_| AppError::Cancelled)?,
@@ -1529,54 +1519,14 @@ impl BotService {
             cancellation,
         )
         .await;
-        let first_download = self.download_with_status(&source, task, cancellation).await;
-        let downloaded = match first_download {
-            Ok(downloaded) => downloaded,
-            Err(AppError::Expired) => {
-                self.update_status_html(
-                    task,
-                    i18n::status(task.preferences.language, Status::Parsing),
-                    cancellation,
-                )
-                .await;
-                let refreshed = tokio::select! {
-                    _ = cancellation.cancelled() => return Err(AppError::Cancelled),
-                    result = self.resolver.resolve_url(&task.post.canonical_url) => result?,
-                };
-                source = refreshed.video;
-                self.update_status_html(
-                    task,
-                    i18n::status(task.preferences.language, Status::Downloading),
-                    cancellation,
-                )
-                .await;
-                self.download_with_status(&source, task, cancellation)
-                    .await?
-            }
-            Err(error) => return Err(error),
-        };
+        let (downloaded, probe) = self
+            .prepare_post_media(&task.post, task, cancellation)
+            .await?;
 
         let result = async {
             if cancellation.is_cancelled() {
                 return Err(AppError::Cancelled);
             }
-            if downloaded.bytes > TELEGRAM_FILE_LIMIT_BYTES {
-                return Err(AppError::MediaTooLarge {
-                    actual: downloaded.bytes,
-                    limit: TELEGRAM_FILE_LIMIT_BYTES,
-                });
-            }
-
-            if let Some(decode_key) = source.decode_key {
-                tokio::select! {
-                    _ = cancellation.cancelled() => return Err(AppError::Cancelled),
-                    result = decrypt_file_prefix(&downloaded.path, decode_key) => result?,
-                };
-            }
-            let probe = tokio::select! {
-                _ = cancellation.cancelled() => return Err(AppError::Cancelled),
-                result = probe_media(&downloaded.path) => result?,
-            };
 
             let kind = telegram_media_kind(probe.codec);
             let video_metadata = telegram_video_metadata(&probe);
@@ -1624,7 +1574,8 @@ impl BotService {
             let edited = match edit_result {
                 Ok(message) => message,
                 Err(error)
-                    if kind == TelegramMediaKind::Video && error.error_code() == Some(400) =>
+                    if kind == TelegramMediaKind::Video
+                        && error.is_video_compatibility_failure() =>
                 {
                     tokio::select! {
                         _ = cancellation.cancelled() => return Err(AppError::Cancelled),
@@ -1738,13 +1689,98 @@ impl BotService {
         };
         match cached_edit {
             Ok(_) => Ok(true),
-            Err(error) if error.error_code() == Some(400) => {
+            Err(error) if error.is_cached_file_reference_invalid() => {
                 self.cache
                     .remove_if_file_id(&task.post.platform, &task.post.post_id, &cached.file_id)
                     .await?;
                 Ok(false)
             }
             Err(error) => Err(error.into()),
+        }
+    }
+
+    async fn prepare_post_media(
+        &self,
+        post: &ResolvedPost,
+        task: &MediaTask,
+        cancellation: &CancellationToken,
+    ) -> Result<(DownloadedMedia, MediaProbe)> {
+        let mut sources = post.media_sources().cloned().collect::<Vec<_>>();
+        let mut can_refresh = true;
+        loop {
+            let mut last_source_error = None;
+            for source in sources {
+                match self.prepare_media_source(&source, task, cancellation).await {
+                    Ok(prepared) => return Ok(prepared),
+                    Err(error) if source_error_allows_fallback(&error) => {
+                        last_source_error = Some(error);
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+
+            if !can_refresh {
+                return Err(last_source_error.unwrap_or(AppError::MediaUnavailable));
+            }
+            can_refresh = false;
+            self.update_status_html(
+                task,
+                i18n::status(task.preferences.language, Status::Parsing),
+                cancellation,
+            )
+            .await;
+            let refreshed = tokio::select! {
+                _ = cancellation.cancelled() => return Err(AppError::Cancelled),
+                result = self.resolver.resolve_url(&post.canonical_url) => result?,
+            };
+            sources = refreshed.media_sources().cloned().collect();
+            self.update_status_html(
+                task,
+                i18n::status(task.preferences.language, Status::Downloading),
+                cancellation,
+            )
+            .await;
+        }
+    }
+
+    async fn prepare_media_source(
+        &self,
+        source: &MediaSource,
+        task: &MediaTask,
+        cancellation: &CancellationToken,
+    ) -> Result<(DownloadedMedia, MediaProbe)> {
+        let downloaded = self
+            .download_with_status(source, task, cancellation)
+            .await?;
+        let preparation = async {
+            if downloaded.bytes > TELEGRAM_FILE_LIMIT_BYTES {
+                return Err(AppError::MediaTooLarge {
+                    actual: downloaded.bytes,
+                    limit: TELEGRAM_FILE_LIMIT_BYTES,
+                });
+            }
+            if let Some(decode_key) = source.decode_key {
+                tokio::select! {
+                    _ = cancellation.cancelled() => return Err(AppError::Cancelled),
+                    result = decrypt_file_prefix(&downloaded.path, decode_key) => result?,
+                };
+            }
+            let probe = tokio::select! {
+                _ = cancellation.cancelled() => return Err(AppError::Cancelled),
+                result = probe_media(&downloaded.path) => result?,
+            };
+            Ok(probe)
+        }
+        .await;
+
+        match preparation {
+            Ok(probe) => Ok((downloaded, probe)),
+            Err(error) => {
+                if let Err(cleanup_error) = downloaded.cleanup().await {
+                    warn!(error = %cleanup_error, "无效候选媒体的临时文件清理失败");
+                }
+                Err(error)
+            }
         }
     }
 
@@ -1868,7 +1904,7 @@ impl BotService {
         user_id: u64,
         source_message_id: i64,
         cancellation: &CancellationToken,
-        preferences: UserPreferences,
+        preferences: UserSettings,
     ) -> Result<bool> {
         let Some(channel_id) = self.required_channel_id.as_deref() else {
             return Ok(true);
@@ -1985,8 +2021,6 @@ fn app_error_kind(error: &AppError) -> &'static str {
         AppError::Cancelled => "cancelled",
         AppError::Database(_) => "database",
         AppError::Io(_) => "io",
-        AppError::Json(_) => "json",
-        AppError::Url(_) => "url",
     }
 }
 
@@ -2015,6 +2049,13 @@ fn message_command(message: &Message) -> Option<&str> {
 
 fn is_settings_command_message(message: &Message) -> bool {
     message_command(message).is_some_and(|command| matches!(command, "setting" | "settings"))
+}
+
+fn source_error_allows_fallback(error: &AppError) -> bool {
+    matches!(
+        error,
+        AppError::Expired | AppError::NotFound | AppError::InvalidMedia(_)
+    )
 }
 
 fn telegram_media_kind(codec: VideoCodec) -> TelegramMediaKind {
@@ -2076,7 +2117,7 @@ fn format_queue_status(waiting_count: usize) -> String {
 
 fn settings_panel(
     language: Language,
-    preferences: UserPreferences,
+    preferences: UserSettings,
     user_id: u64,
 ) -> (String, InlineKeyboardMarkup) {
     // Keep the message itself compact.  The current values are already shown
@@ -2176,17 +2217,35 @@ mod tests {
     }
 
     #[test]
+    fn source_fallback_is_limited_to_unavailable_or_invalid_media() {
+        for error in [
+            AppError::Expired,
+            AppError::NotFound,
+            AppError::InvalidMedia("not a video".into()),
+        ] {
+            assert!(source_error_allows_fallback(&error));
+        }
+        for error in [
+            AppError::Config("ffprobe missing".into()),
+            AppError::Network("timed out".into()),
+            AppError::MediaTooLarge {
+                actual: 2,
+                limit: 1,
+            },
+            AppError::Storage("/tmp".into()),
+            AppError::Cancelled,
+        ] {
+            assert!(!source_error_allows_fallback(&error));
+        }
+    }
+
+    #[test]
     fn media_captions_are_inputs_but_never_commands_or_deletion_targets() {
         let message = |text: Option<&str>, caption: Option<&str>| Message {
             message_id: 1,
-            date: 0,
             chat: crate::telegram::api::Chat {
                 id: 1,
                 kind: crate::telegram::api::ChatKind::Private,
-                title: None,
-                username: None,
-                first_name: None,
-                last_name: None,
             },
             sender: None,
             text: text.map(str::to_owned),
@@ -2204,74 +2263,6 @@ mod tests {
         let text_command = message(Some("/settings@parse_bot"), None);
         assert_eq!(message_command(&text_command), Some("settings"));
         assert!(is_settings_command_message(&text_command));
-    }
-
-    #[test]
-    fn sanitizes_sensitive_inbound_log_text_into_one_line() {
-        let bot_token = "123456789:abcdefghijklmnopqrstuvwxyz_1234567890";
-        let opaque_id = "A".repeat(80);
-        let preview = sanitize_inbound_log_preview(&format!(
-            "第一\u{202e}行\n第二行 https://alice:secret@example.test/watch?ticket=private#fragment \
-             TELEGRAM_BOT_TOKEN='{bot_token}' id={opaque_id}"
-        ));
-
-        assert!(preview.starts_with("第一行 第二行 "));
-        assert!(preview.contains("https://example.test/watch?<redacted>"));
-        assert!(preview.contains("TELEGRAM_BOT_TOKEN=<redacted>"));
-        assert!(preview.contains("id=<redacted-id>"));
-        assert!(!preview.contains("alice"));
-        assert!(!preview.contains("secret"));
-        assert!(!preview.contains("ticket"));
-        assert!(!preview.contains(bot_token));
-        assert!(!preview.contains(&opaque_id));
-        assert!(!preview.chars().any(char::is_control));
-        assert!(!preview.contains('\u{202e}'));
-    }
-
-    #[test]
-    fn redacts_token_bearer_and_whole_line_credentials() {
-        let preview = sanitize_inbound_log_preview(
-            "ACCESS_TOKEN=private-token Bearer private-bearer\n\
-             Cookie=session=private; user=42 still-private\n\
-             password: correct horse battery staple\nvisible",
-        );
-
-        assert_eq!(
-            preview,
-            "ACCESS_TOKEN=<redacted> Bearer <redacted> Cookie=<redacted> password:<redacted> visible"
-        );
-        assert!(!preview.contains("private"));
-        assert!(!preview.contains("session"));
-        assert!(!preview.contains("correct horse"));
-    }
-
-    #[test]
-    fn redacts_queries_after_bot_tokens_inside_urls() {
-        let bot_token = "123456789:abcdefghijklmnopqrstuvwxyz_1234567890";
-        let preview = sanitize_inbound_log_preview(&format!(
-            "https://api.telegram.org/bot{bot_token}/sendMessage?chat_id=private#fragment"
-        ));
-
-        assert!(preview.contains("<redacted-bot-token>"));
-        assert!(preview.ends_with("?<redacted>"));
-        assert!(!preview.contains(bot_token));
-        assert!(!preview.contains("chat_id"));
-        assert!(!preview.contains("private"));
-    }
-
-    #[test]
-    fn truncates_inbound_log_text_on_unicode_character_boundaries() {
-        let preview = sanitize_inbound_log_preview(&"界".repeat(300));
-
-        assert_eq!(preview.chars().count(), INBOUND_LOG_PREVIEW_CHARS);
-        assert!(preview.ends_with('…'));
-        assert_eq!(
-            preview
-                .chars()
-                .filter(|character| *character == '界')
-                .count(),
-            239
-        );
     }
 
     #[test]
@@ -2477,7 +2468,6 @@ mod tests {
 
     #[test]
     fn limits_active_workflows_to_ten() {
-        assert_eq!(MEDIA_PIPELINE_CONCURRENCY, MAX_ACTIVE_TASKS);
         let mut scheduler = FairTaskScheduler::new(SchedulerLimits::default());
         for user_id in 1..=MAX_ACTIVE_TASKS as u64 {
             assert!(matches!(

@@ -1,11 +1,11 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     fmt,
     future::Future,
     path::{Path, PathBuf},
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::Duration,
 };
@@ -33,7 +33,8 @@ use tokio::{
     sync::{Mutex, Notify, mpsc, oneshot},
     task::JoinHandle,
 };
-use tracing::info;
+use tokio_util::task::TaskTracker;
+use tracing::{info, warn};
 use uuid::Uuid;
 
 use crate::media::{DownloadedMedia, MediaDownloader};
@@ -46,10 +47,13 @@ use super::api::{
 
 const AUTHORIZATION_TIMEOUT: Duration = Duration::from_secs(60);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(15);
-const SEND_COMPLETION_TIMEOUT: Duration = Duration::from_secs(6 * 60 * 60);
+const TD_CALL_TIMEOUT: Duration = Duration::from_secs(60);
+const MEDIA_EDIT_TIMEOUT: Duration = Duration::from_secs(2 * 60 * 60);
+const SEND_COMPLETION_TIMEOUT: Duration = Duration::from_secs(2 * 60);
 const COVER_MAX_BYTES: u64 = 20 * 1024 * 1024;
 const COVER_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(30);
 const UPDATE_CHANNEL_CAPACITY: usize = 1024;
+static RAW_DROPPED_UPDATES: AtomicU64 = AtomicU64::new(0);
 
 // tdlib-rs exposes one process-wide `receive` entry point. Starting two pumps
 // would let one client consume the other's responses and deadlock both.
@@ -105,6 +109,7 @@ struct Inner {
     closed_notify: Arc<Notify>,
     terminal: Arc<TerminalState>,
     cover_downloader: MediaDownloader,
+    detached_requests: TaskTracker,
 }
 
 enum RawEvent {
@@ -118,6 +123,7 @@ enum TerminalReason {
     UpdateOverflow,
     UpdateReceiverClosed,
     ReceivePumpFailed,
+    RequestTimedOut,
 }
 
 impl TerminalReason {
@@ -126,7 +132,7 @@ impl TerminalReason {
             Self::Closed => 0,
             Self::AuthorizationLost => 1,
             Self::UpdateOverflow | Self::UpdateReceiverClosed => 2,
-            Self::ReceivePumpFailed => 3,
+            Self::ReceivePumpFailed | Self::RequestTimedOut => 3,
         }
     }
 
@@ -146,6 +152,9 @@ impl TerminalReason {
             ),
             Self::ReceivePumpFailed => {
                 TelegramError::runtime("receive", "TDLib receive task stopped unexpectedly")
+            }
+            Self::RequestTimedOut => {
+                TelegramError::runtime("receive", "TDLib media request timed out")
             }
         }
     }
@@ -204,25 +213,36 @@ struct SendTracker {
 
 #[derive(Default)]
 struct SendTrackerState {
-    waiters: HashMap<SendKey, oneshot::Sender<Result<tdlib_rs::types::Message, SendFailure>>>,
+    waiters: HashMap<SendKey, SendWaiter>,
     early_outcomes: HashMap<SendKey, SendOutcome>,
+    early_outcome_order: VecDeque<SendKey>,
+    next_registration: u64,
 }
 
 type SendKey = (i64, i64);
+
+struct SendWaiter {
+    registration: u64,
+    sender: oneshot::Sender<Result<tdlib_rs::types::Message, SendFailure>>,
+}
 
 impl SendTracker {
     fn complete(&self, key: SendKey, outcome: SendOutcome) {
         let mut state = self.state.lock();
         if let Some(waiter) = state.waiters.remove(&key) {
-            let _ = waiter.send(outcome_to_result(outcome));
+            let _ = waiter.sender.send(outcome_to_result(outcome));
         } else {
             // A completion can beat registration because the receive pump and
             // function observer are independent. Bound abandoned outcomes so
             // cancellation cannot grow this map forever.
-            if state.early_outcomes.len() >= 1024
-                && let Some(oldest) = state.early_outcomes.keys().next().copied()
-            {
-                state.early_outcomes.remove(&oldest);
+            if !state.early_outcomes.contains_key(&key) {
+                while state.early_outcomes.len() >= 1024 {
+                    let Some(oldest) = state.early_outcome_order.pop_front() else {
+                        break;
+                    };
+                    state.early_outcomes.remove(&oldest);
+                }
+                state.early_outcome_order.push_back(key);
             }
             state.early_outcomes.insert(key, outcome);
         }
@@ -253,13 +273,15 @@ impl SendTracker {
     }
 
     async fn wait(&self, key: SendKey) -> Result<tdlib_rs::types::Message, SendFailure> {
-        let receiver = {
+        let (receiver, registration) = {
             let mut state = self.state.lock();
             if let Some(outcome) = state.early_outcomes.remove(&key) {
+                state
+                    .early_outcome_order
+                    .retain(|candidate| *candidate != key);
                 return outcome_to_result(outcome);
             }
-            let (sender, receiver) = oneshot::channel();
-            if state.waiters.insert(key, sender).is_some() {
+            if state.waiters.contains_key(&key) {
                 return Err(SendFailure {
                     error: TelegramError::runtime(
                         "sendMessage",
@@ -269,7 +291,22 @@ impl SendTracker {
                     failed_message: None,
                 });
             }
-            receiver
+            let (sender, receiver) = oneshot::channel();
+            let registration = state.next_registration;
+            state.next_registration = state.next_registration.wrapping_add(1);
+            state.waiters.insert(
+                key,
+                SendWaiter {
+                    registration,
+                    sender,
+                },
+            );
+            (receiver, registration)
+        };
+        let _registration = SendWaiterRegistration {
+            tracker: self,
+            key,
+            registration,
         };
 
         match tokio::time::timeout(SEND_COMPLETION_TIMEOUT, receiver).await {
@@ -278,26 +315,43 @@ impl SendTracker {
                 need_drop_reply: false,
                 failed_message: None,
             })),
-            Err(_) => {
-                self.state.lock().waiters.remove(&key);
-                Err(SendFailure {
-                    error: TelegramError::runtime("sendMessage", "TDLib send completion timed out"),
-                    need_drop_reply: false,
-                    failed_message: None,
-                })
-            }
+            Err(_) => Err(SendFailure {
+                error: TelegramError::runtime("sendMessage", "TDLib send completion timed out"),
+                need_drop_reply: false,
+                failed_message: None,
+            }),
         }
     }
 
     fn fail_all(&self) {
         let mut state = self.state.lock();
         state.early_outcomes.clear();
+        state.early_outcome_order.clear();
         for (_, waiter) in state.waiters.drain() {
-            let _ = waiter.send(Err(SendFailure {
+            let _ = waiter.sender.send(Err(SendFailure {
                 error: TelegramError::Closed,
                 need_drop_reply: false,
                 failed_message: None,
             }));
+        }
+    }
+}
+
+struct SendWaiterRegistration<'a> {
+    tracker: &'a SendTracker,
+    key: SendKey,
+    registration: u64,
+}
+
+impl Drop for SendWaiterRegistration<'_> {
+    fn drop(&mut self) {
+        let mut state = self.tracker.state.lock();
+        if state
+            .waiters
+            .get(&self.key)
+            .is_some_and(|waiter| waiter.registration == self.registration)
+        {
+            state.waiters.remove(&self.key);
         }
     }
 }
@@ -382,6 +436,7 @@ impl TelegramClient {
                 closed_notify,
                 terminal,
                 cover_downloader,
+                detached_requests: TaskTracker::new(),
             }),
         };
 
@@ -531,6 +586,13 @@ impl TelegramClient {
         self.inner.closed_notify.notify_one();
         self.inner.send_tracker.fail_all();
         self.stop_pump().await;
+        self.inner.detached_requests.close();
+        if tokio::time::timeout(SHUTDOWN_TIMEOUT, self.inner.detached_requests.wait())
+            .await
+            .is_err()
+        {
+            warn!("TDLib 已关闭，但仍有媒体请求未返回；运行时退出时将终止这些任务");
+        }
         if self.inner.closed.load(Ordering::Acquire) {
             CLIENT_ACTIVE.store(false, Ordering::Release);
         }
@@ -602,8 +664,18 @@ impl TelegramClient {
     where
         F: Future<Output = Result<T, tdlib_rs::types::Error>>,
     {
-        self.prioritize_terminal(async move { map_td(method, future.await) })
-            .await
+        self.prioritize_terminal(async move {
+            let result = tokio::time::timeout(TD_CALL_TIMEOUT, future)
+                .await
+                .map_err(|_| {
+                    TelegramError::runtime(
+                        method,
+                        format!("TDLib call timed out after {}s", TD_CALL_TIMEOUT.as_secs()),
+                    )
+                })?;
+            map_td(method, result)
+        })
+        .await
     }
 
     pub async fn next_update(&self) -> TelegramResult<Update> {
@@ -612,7 +684,7 @@ impl TelegramClient {
                 RawEvent::Update(update) => match *update {
                     TdUpdate::NewMessage(update) if !update.message.is_outgoing => {
                         let message = self
-                            .prioritize_terminal(self.normalize_message(update.message, true))
+                            .prioritize_terminal(self.normalize_message(update.message, false))
                             .await?;
                         return Ok(Update {
                             message: Some(message),
@@ -639,8 +711,6 @@ impl TelegramClient {
                                 id: update.id.to_string(),
                                 sender,
                                 message: None,
-                                inline_message_id: Some(update.inline_message_id),
-                                chat_instance: Some(update.chat_instance.to_string()),
                                 data,
                             }),
                         });
@@ -827,7 +897,7 @@ impl TelegramClient {
                 .map_err(|failure| failure.error)?,
             Err(failure) => return Err(failure.error),
         };
-        self.normalize_message(message, true).await
+        self.normalize_message(message, false).await
     }
 
     async fn send_td_message(
@@ -962,7 +1032,7 @@ impl TelegramClient {
                 ),
             )
             .await?;
-        self.normalize_message(message, true).await
+        self.normalize_message(message, false).await
     }
 
     pub async fn edit_message_video_html_with_cover(
@@ -1067,7 +1137,7 @@ impl TelegramClient {
                 files,
             )
             .await?;
-        self.normalize_message(message, true).await
+        self.normalize_message(message, false).await
     }
 
     pub async fn edit_message_document_html(
@@ -1095,7 +1165,7 @@ impl TelegramClient {
                 vec![document],
             )
             .await?;
-        self.normalize_message(message, true).await
+        self.normalize_message(message, false).await
     }
 
     async fn edit_media_detached(
@@ -1106,8 +1176,9 @@ impl TelegramClient {
         content: InputMessageContent,
         files: Vec<PreparedInputFile>,
     ) -> TelegramResult<TdMessage> {
+        self.ensure_open()?;
         let client_id = self.inner.client_id;
-        let request = tokio::spawn(async move {
+        let request = self.inner.detached_requests.spawn(async move {
             let result = map_td(
                 "editMessageMedia",
                 functions::edit_message_media(
@@ -1125,10 +1196,23 @@ impl TelegramClient {
             drop(files);
             result
         });
+        let terminal = Arc::clone(&self.inner.terminal);
         self.prioritize_terminal(async move {
-            request
-                .await
-                .map_err(|_| TelegramError::runtime("editMessageMedia", "TDLib edit task failed"))?
+            match tokio::time::timeout(MEDIA_EDIT_TIMEOUT, request).await {
+                Ok(result) => result.map_err(|_| {
+                    TelegramError::runtime("editMessageMedia", "TDLib edit task failed")
+                })?,
+                Err(_) => {
+                    // Keep the detached task (and its upload lease) alive until
+                    // TDLib closes, but make the client terminal so no new
+                    // media pipeline can replace this timed-out one.
+                    terminal.set(TerminalReason::RequestTimedOut);
+                    Err(TelegramError::runtime(
+                        "editMessageMedia",
+                        "TDLib media edit timed out",
+                    ))
+                }
+            }
         })
         .await
     }
@@ -1285,29 +1369,31 @@ impl TelegramClient {
         &self,
         update: tdlib_rs::types::UpdateNewCallbackQuery,
     ) -> TelegramResult<CallbackQuery> {
-        let sender = self.get_user_by_id(update.sender_user_id).await?;
-        let message = match self
-            .td_call(
-                "getCallbackQueryMessage",
-                functions::get_callback_query_message(
-                    update.chat_id,
-                    update.message_id,
-                    update.id,
-                    self.inner.client_id,
-                ),
-            )
-            .await
-        {
-            Ok(TdMessage::Message(message)) => Some(self.normalize_message(message, true).await?),
-            Err(error) if error.is_terminal() => return Err(error),
-            Err(_) => None,
-        };
+        let (sender, message) =
+            tokio::try_join!(self.get_user_by_id(update.sender_user_id), async {
+                match self
+                    .td_call(
+                        "getCallbackQueryMessage",
+                        functions::get_callback_query_message(
+                            update.chat_id,
+                            update.message_id,
+                            update.id,
+                            self.inner.client_id,
+                        ),
+                    )
+                    .await
+                {
+                    Ok(TdMessage::Message(message)) => {
+                        Ok(Some(self.normalize_message(message, true).await?))
+                    }
+                    Err(error) if error.is_terminal() => Err(error),
+                    Err(_) => Ok(None),
+                }
+            })?;
         Ok(CallbackQuery {
             id: update.id.to_string(),
             sender,
             message,
-            inline_message_id: None,
-            chat_instance: Some(update.chat_instance.to_string()),
             data: decode_callback_payload(update.payload)?,
         })
     }
@@ -1351,11 +1437,16 @@ impl TelegramClient {
         &self,
         message: tdlib_rs::types::Message,
     ) -> TelegramResult<Message> {
-        let chat = self.get_chat_by_id(message.chat_id).await?;
-        let sender = match message.sender_id {
-            MessageSender::User(sender) => Some(self.get_user_by_id(sender.user_id).await?),
+        let sender_user_id = match message.sender_id {
+            MessageSender::User(sender) => Some(sender.user_id),
             MessageSender::Chat(_) => None,
         };
+        let (chat, sender) = tokio::try_join!(self.get_chat_by_id(message.chat_id), async {
+            match sender_user_id {
+                Some(user_id) => self.get_user_by_id(user_id).await.map(Some),
+                None => Ok(None),
+            }
+        })?;
 
         let (text, caption, video, document) = match message.content {
             MessageContent::MessageText(content) => (Some(content.text.text), None, None, None),
@@ -1367,11 +1458,6 @@ impl TelegramClient {
                     Some(Video {
                         file_id: file.remote.id,
                         file_unique_id: file.remote.unique_id,
-                        width: nonnegative_u32(content.video.width),
-                        height: nonnegative_u32(content.video.height),
-                        duration: nonnegative_u32(content.video.duration),
-                        file_name: nonempty(content.video.file_name),
-                        mime_type: nonempty(content.video.mime_type),
                         file_size: known_file_size(file.size),
                     }),
                     None,
@@ -1386,8 +1472,6 @@ impl TelegramClient {
                     Some(Document {
                         file_id: file.remote.id,
                         file_unique_id: file.remote.unique_id,
-                        file_name: nonempty(content.document.file_name),
-                        mime_type: nonempty(content.document.mime_type),
                         file_size: known_file_size(file.size),
                     }),
                 )
@@ -1397,7 +1481,6 @@ impl TelegramClient {
 
         Ok(Message {
             message_id: message.id,
-            date: i64::from(message.date),
             chat,
             sender,
             text,
@@ -1426,62 +1509,25 @@ impl TelegramClient {
             )
             .await?;
         match chat.r#type {
-            ChatType::Private(private) => {
-                let user = self.get_user_by_id(private.user_id).await?;
-                Ok(Chat {
-                    id: chat.id,
-                    kind: ChatKind::Private,
-                    title: None,
-                    username: user.username.clone(),
-                    first_name: Some(user.first_name),
-                    last_name: user.last_name,
-                })
-            }
+            ChatType::Private(_) => Ok(Chat {
+                id: chat.id,
+                kind: ChatKind::Private,
+            }),
             ChatType::BasicGroup(_) => Ok(Chat {
                 id: chat.id,
                 kind: ChatKind::Group,
-                title: nonempty(chat.title),
-                username: None,
-                first_name: None,
-                last_name: None,
             }),
-            ChatType::Supergroup(supergroup_type) => {
-                let username = match self
-                    .td_call(
-                        "getSupergroup",
-                        functions::get_supergroup(
-                            supergroup_type.supergroup_id,
-                            self.inner.client_id,
-                        ),
-                    )
-                    .await
-                {
-                    Ok(tdlib_rs::enums::Supergroup::Supergroup(supergroup)) => supergroup
-                        .usernames
-                        .and_then(|names| names.active_usernames.into_iter().next()),
-                    Err(error) if error.is_terminal() => return Err(error),
-                    Err(_) => None,
-                };
-                Ok(Chat {
-                    id: chat.id,
-                    kind: if supergroup_type.is_channel {
-                        ChatKind::Channel
-                    } else {
-                        ChatKind::Supergroup
-                    },
-                    title: nonempty(chat.title),
-                    username,
-                    first_name: None,
-                    last_name: None,
-                })
-            }
+            ChatType::Supergroup(supergroup_type) => Ok(Chat {
+                id: chat.id,
+                kind: if supergroup_type.is_channel {
+                    ChatKind::Channel
+                } else {
+                    ChatKind::Supergroup
+                },
+            }),
             ChatType::Secret(_) => Ok(Chat {
                 id: chat.id,
                 kind: ChatKind::Unknown,
-                title: nonempty(chat.title),
-                username: None,
-                first_name: None,
-                last_name: None,
             }),
         }
     }
@@ -1618,12 +1664,18 @@ fn spawn_receive_pump(pump: ReceivePump) -> JoinHandle<()> {
                         &pump.updates,
                         &pump.terminal,
                         TdUpdate::AuthorizationState(update),
+                        UpdateOverflowPolicy::Terminal,
                     );
                 }
                 update @ (TdUpdate::NewMessage(_)
                 | TdUpdate::NewCallbackQuery(_)
                 | TdUpdate::NewInlineCallbackQuery(_)) => {
-                    try_dispatch_update(&pump.updates, &pump.terminal, update);
+                    try_dispatch_update(
+                        &pump.updates,
+                        &pump.terminal,
+                        update,
+                        UpdateOverflowPolicy::DropNewest,
+                    );
                 }
                 _ => {}
             }
@@ -1655,19 +1707,39 @@ fn try_dispatch_update(
     updates: &mpsc::Sender<RawEvent>,
     terminal: &TerminalState,
     update: TdUpdate,
+    overflow_policy: UpdateOverflowPolicy,
 ) {
     if terminal.error().is_some() {
         return;
     }
     match updates.try_send(RawEvent::Update(Box::new(update))) {
         Ok(()) => {}
-        Err(mpsc::error::TrySendError::Full(_)) => {
-            terminal.set(TerminalReason::UpdateOverflow);
-        }
+        Err(mpsc::error::TrySendError::Full(_)) => match overflow_policy {
+            UpdateOverflowPolicy::Terminal => terminal.set(TerminalReason::UpdateOverflow),
+            UpdateOverflowPolicy::DropNewest => {
+                let dropped_total = RAW_DROPPED_UPDATES
+                    .fetch_add(1, Ordering::Relaxed)
+                    .saturating_add(1);
+                if dropped_total == 1 || dropped_total.is_multiple_of(1_000) {
+                    warn!(
+                        event = "telegram_raw_update_dropped",
+                        reason = "application_queue_full",
+                        dropped_total,
+                        "TDLib update 队列已满，丢弃最新业务 update"
+                    );
+                }
+            }
+        },
         Err(mpsc::error::TrySendError::Closed(_)) => {
             terminal.set(TerminalReason::UpdateReceiverClosed);
         }
     }
+}
+
+#[derive(Clone, Copy)]
+enum UpdateOverflowPolicy {
+    Terminal,
+    DropNewest,
 }
 
 fn validate_config(config: &TdlibConfig) -> TelegramResult<()> {
@@ -1704,14 +1776,10 @@ fn normalize_user(user: tdlib_rs::types::User) -> TelegramResult<User> {
         id: u64::try_from(user.id).map_err(|_| {
             TelegramError::runtime("normalize user", "negative Telegram user identifier")
         })?,
-        is_bot: matches!(user.r#type, UserType::Bot(_)),
-        first_name: user.first_name,
-        last_name: nonempty(user.last_name),
         username: user
             .usernames
             .and_then(|usernames| usernames.active_usernames.into_iter().next()),
         language_code: nonempty(user.language_code),
-        is_premium: Some(user.is_premium),
     })
 }
 
@@ -1784,10 +1852,6 @@ fn map_td<T>(method: &'static str, result: Result<T, tdlib_rs::types::Error>) ->
 
 fn checked_i32(value: u32, reason: &'static str) -> TelegramResult<i32> {
     i32::try_from(value).map_err(|_| TelegramError::InvalidInputFile { reason })
-}
-
-fn nonnegative_u32(value: i32) -> u32 {
-    u32::try_from(value).unwrap_or(0)
 }
 
 fn known_file_size(value: i64) -> Option<u64> {
@@ -2021,13 +2085,38 @@ mod tests {
                 authorization_state: AuthorizationState::Ready,
             })
         };
-        try_dispatch_update(&updates, &terminal, ready());
+        try_dispatch_update(&updates, &terminal, ready(), UpdateOverflowPolicy::Terminal);
         assert!(terminal.error().is_none());
-        try_dispatch_update(&updates, &terminal, ready());
+        try_dispatch_update(&updates, &terminal, ready(), UpdateOverflowPolicy::Terminal);
         assert!(matches!(
             *terminal.reason.lock(),
             Some(TerminalReason::UpdateOverflow)
         ));
+    }
+
+    #[test]
+    fn business_update_overflow_is_load_shed_without_killing_the_client() {
+        let (updates, _receiver) = mpsc::channel(1);
+        let terminal = TerminalState::new();
+        let ready = || {
+            TdUpdate::AuthorizationState(tdlib_rs::types::UpdateAuthorizationState {
+                authorization_state: AuthorizationState::Ready,
+            })
+        };
+        try_dispatch_update(
+            &updates,
+            &terminal,
+            ready(),
+            UpdateOverflowPolicy::DropNewest,
+        );
+        try_dispatch_update(
+            &updates,
+            &terminal,
+            ready(),
+            UpdateOverflowPolicy::DropNewest,
+        );
+
+        assert!(terminal.error().is_none());
     }
 
     #[test]
@@ -2040,5 +2129,51 @@ mod tests {
             *terminal.reason.lock(),
             Some(TerminalReason::ReceivePumpFailed)
         ));
+    }
+
+    #[tokio::test]
+    async fn send_waiter_cancellation_unregisters_without_replacing_duplicates() {
+        let tracker = Arc::new(SendTracker::default());
+        let key = (42, 101);
+        let waiting_tracker = Arc::clone(&tracker);
+        let waiting = tokio::spawn(async move { waiting_tracker.wait(key).await });
+        for _ in 0..10 {
+            if tracker.state.lock().waiters.contains_key(&key) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(tracker.state.lock().waiters.contains_key(&key));
+
+        let duplicate = tracker.wait(key).await.unwrap_err();
+        assert!(duplicate.error.to_string().contains("duplicate pending"));
+        assert!(tracker.state.lock().waiters.contains_key(&key));
+
+        waiting.abort();
+        let _ = waiting.await;
+        assert!(!tracker.state.lock().waiters.contains_key(&key));
+    }
+
+    #[test]
+    fn early_send_outcomes_evict_in_insertion_order() {
+        let tracker = SendTracker::default();
+        for message_id in 0..=1024 {
+            tracker.complete(
+                (1, message_id),
+                SendOutcome::Failed {
+                    error: tdlib_rs::types::Error {
+                        code: 500,
+                        message: "test".to_owned(),
+                    },
+                    need_drop_reply: false,
+                    failed_message: None,
+                },
+            );
+        }
+        let state = tracker.state.lock();
+        assert_eq!(state.early_outcomes.len(), 1024);
+        assert!(!state.early_outcomes.contains_key(&(1, 0)));
+        assert!(state.early_outcomes.contains_key(&(1, 1024)));
+        assert_eq!(state.early_outcome_order.front(), Some(&(1, 1)));
     }
 }

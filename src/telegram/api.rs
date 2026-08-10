@@ -106,6 +106,72 @@ impl TelegramError {
                     "PHOTO_INVALID",
                     "PHOTO_SAVE_FILE_INVALID",
                     "IMAGE_PROCESS_FAILED",
+                    "WRONG FILE IDENTIFIER/HTTP URL",
+                ]
+                .iter()
+                .any(|marker| description.contains(marker))
+            }
+            _ => false,
+        }
+    }
+
+    /// Returns whether a cached Telegram remote identifier or its file
+    /// reference is explicitly invalid. Generic bad requests must not evict a
+    /// valid cache entry, because the message, caption, or permissions may be
+    /// the actual problem.
+    pub fn is_cached_file_reference_invalid(&self) -> bool {
+        let Self::Api {
+            error_code: Some(400),
+            description,
+            ..
+        } = self
+        else {
+            return false;
+        };
+        let description = description.to_ascii_uppercase();
+        [
+            "FILE_ID_INVALID",
+            "FILE_REFERENCE_EMPTY",
+            "FILE_REFERENCE_EXPIRED",
+            "FILE_REFERENCE_INVALID",
+            "INVALID REMOTE FILE IDENTIFIER",
+            "NO VALID FILE REFERENCE",
+            "REMOTE FILE IDENTIFIER MUST BE NON-EMPTY",
+            "VIDEO HAS INVALID FILE_ID",
+            "WRONG FILE IDENTIFIER",
+            "WRONG REMOTE FILE IDENTIFIER",
+        ]
+        .iter()
+        .any(|marker| description.contains(marker))
+    }
+
+    /// Returns whether Telegram rejected a video specifically because it
+    /// cannot be represented as a video message and retrying the same bytes as
+    /// a document can make progress.
+    pub fn is_video_compatibility_failure(&self) -> bool {
+        match self {
+            Self::InvalidInputFile { reason } => matches!(
+                *reason,
+                "video width is out of range"
+                    | "video height is out of range"
+                    | "video duration is out of range"
+            ),
+            Self::Api {
+                error_code: Some(400),
+                description,
+                ..
+            } => {
+                let description = description.to_ascii_uppercase();
+                [
+                    "INVALID VIDEO DURATION SPECIFIED",
+                    "INVALID VIDEO MESSAGE FILE SPECIFIED",
+                    "UNALLOWED VIDEO MIME TYPE",
+                    "VIDEO_CODEC_NOT_SUPPORTED",
+                    "VIDEO_CONTENT_TYPE_INVALID",
+                    "VIDEO_DIMENSIONS_INVALID",
+                    "VIDEO_FILE_INVALID",
+                    "VIDEO_FORMAT_NOT_SUPPORTED",
+                    "VIDEO_INVALID_DIMENSIONS",
                 ]
                 .iter()
                 .any(|marker| description.contains(marker))
@@ -255,10 +321,6 @@ impl InputFile {
         })
     }
 
-    pub fn is_local(&self) -> bool {
-        matches!(self.source, InputFileSource::LocalPath(_))
-    }
-
     pub(crate) fn source(&self) -> &InputFileSource {
         &self.source
     }
@@ -346,12 +408,8 @@ impl InlineKeyboardButton {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct User {
     pub id: u64,
-    pub is_bot: bool,
-    pub first_name: String,
-    pub last_name: Option<String>,
     pub username: Option<String>,
     pub language_code: Option<String>,
-    pub is_premium: Option<bool>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -362,7 +420,6 @@ pub enum ChatMemberStatus {
     Restricted,
     Left,
     Kicked,
-    Unknown,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -377,7 +434,7 @@ impl ChatMember {
             ChatMemberStatus::Creator => self.is_member == Some(true),
             ChatMemberStatus::Administrator | ChatMemberStatus::Member => true,
             ChatMemberStatus::Restricted => self.is_member == Some(true),
-            ChatMemberStatus::Left | ChatMemberStatus::Kicked | ChatMemberStatus::Unknown => false,
+            ChatMemberStatus::Left | ChatMemberStatus::Kicked => false,
         }
     }
 }
@@ -395,10 +452,6 @@ pub enum ChatKind {
 pub struct Chat {
     pub id: i64,
     pub kind: ChatKind,
-    pub title: Option<String>,
-    pub username: Option<String>,
-    pub first_name: Option<String>,
-    pub last_name: Option<String>,
 }
 
 impl Chat {
@@ -411,11 +464,6 @@ impl Chat {
 pub struct Video {
     pub file_id: String,
     pub file_unique_id: String,
-    pub width: u32,
-    pub height: u32,
-    pub duration: u32,
-    pub file_name: Option<String>,
-    pub mime_type: Option<String>,
     pub file_size: Option<u64>,
 }
 
@@ -423,15 +471,12 @@ pub struct Video {
 pub struct Document {
     pub file_id: String,
     pub file_unique_id: String,
-    pub file_name: Option<String>,
-    pub mime_type: Option<String>,
     pub file_size: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Message {
     pub message_id: i64,
-    pub date: i64,
     pub chat: Chat,
     pub sender: Option<User>,
     pub text: Option<String>,
@@ -479,8 +524,6 @@ pub struct CallbackQuery {
     pub id: String,
     pub sender: User,
     pub message: Option<Message>,
-    pub inline_message_id: Option<String>,
-    pub chat_instance: Option<String>,
     pub data: Option<String>,
 }
 
@@ -493,6 +536,15 @@ pub struct Update {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn api_error(error_code: i64, description: &str) -> TelegramError {
+        TelegramError::Api {
+            method: "editMessageMedia",
+            error_code: Some(error_code),
+            description: description.to_owned(),
+            retry_after: None,
+        }
+    }
 
     #[test]
     fn escapes_untrusted_html_text_and_attributes() {
@@ -555,6 +607,15 @@ mod tests {
             TelegramError::Api {
                 method: "editMessageMedia",
                 error_code: Some(400),
+                description: "Wrong file identifier/HTTP URL specified".into(),
+                retry_after: None,
+            }
+            .is_cover_failure()
+        );
+        assert!(
+            TelegramError::Api {
+                method: "editMessageMedia",
+                error_code: Some(400),
                 description: "PHOTO_INVALID_DIMENSIONS".into(),
                 retry_after: None,
             }
@@ -582,17 +643,113 @@ mod tests {
     }
 
     #[test]
+    fn invalidates_cached_files_only_for_explicit_remote_reference_failures() {
+        for description in [
+            "FILE_ID_INVALID",
+            "FILE_REFERENCE_EMPTY",
+            "FILE_REFERENCE_EXPIRED",
+            "FILE_REFERENCE_INVALID",
+            "Invalid remote file identifier",
+            "Can't download file: have no valid file reference",
+            "Remote file identifier must be non-empty",
+            "Video has invalid file_id",
+            "Wrong file identifier/HTTP URL specified",
+            "Wrong remote file identifier specified: can't unserialize it",
+        ] {
+            let error = api_error(400, description);
+            assert!(
+                error.is_cached_file_reference_invalid(),
+                "expected an invalid cached file classification for {description}"
+            );
+        }
+
+        for (error_code, description) in [
+            (400, "MESSAGE_ID_INVALID"),
+            (400, "MESSAGE_NOT_MODIFIED"),
+            (400, "MEDIA_CAPTION_TOO_LONG"),
+            (400, "CHAT_WRITE_FORBIDDEN"),
+            (400, "VIDEO_CONTENT_TYPE_INVALID"),
+            (400, "PHOTO_INVALID_DIMENSIONS"),
+            (403, "FILE_ID_INVALID"),
+            (429, "FILE_REFERENCE_EXPIRED"),
+        ] {
+            let error = api_error(error_code, description);
+            assert!(
+                !error.is_cached_file_reference_invalid(),
+                "unexpected cache invalidation classification for {description}"
+            );
+        }
+        assert!(
+            !TelegramError::runtime("editMessageMedia", "FILE_ID_INVALID")
+                .is_cached_file_reference_invalid()
+        );
+    }
+
+    #[test]
+    fn falls_back_to_document_only_for_video_compatibility_failures() {
+        for description in [
+            "Invalid video duration specified",
+            "Invalid video message file specified",
+            "Unallowed video MIME type",
+            "VIDEO_CODEC_NOT_SUPPORTED",
+            "VIDEO_CONTENT_TYPE_INVALID",
+            "VIDEO_DIMENSIONS_INVALID",
+            "VIDEO_FILE_INVALID",
+            "VIDEO_FORMAT_NOT_SUPPORTED",
+            "VIDEO_INVALID_DIMENSIONS",
+        ] {
+            let error = api_error(400, description);
+            assert!(
+                error.is_video_compatibility_failure(),
+                "expected a video compatibility classification for {description}"
+            );
+        }
+        for reason in [
+            "video width is out of range",
+            "video height is out of range",
+            "video duration is out of range",
+        ] {
+            assert!(
+                TelegramError::InvalidInputFile { reason }.is_video_compatibility_failure(),
+                "expected a video metadata classification for {reason}"
+            );
+        }
+
+        for (error_code, description) in [
+            (400, "MESSAGE_ID_INVALID"),
+            (400, "MESSAGE_NOT_MODIFIED"),
+            (400, "MEDIA_CAPTION_TOO_LONG"),
+            (400, "CHAT_WRITE_FORBIDDEN"),
+            (400, "FILE_ID_INVALID"),
+            (400, "PHOTO_INVALID_DIMENSIONS"),
+            (400, "VIDEO_TOO_LARGE"),
+            (429, "VIDEO_CONTENT_TYPE_INVALID"),
+        ] {
+            let error = api_error(error_code, description);
+            assert!(
+                !error.is_video_compatibility_failure(),
+                "unexpected document fallback classification for {description}"
+            );
+        }
+        assert!(
+            !TelegramError::InvalidInputFile {
+                reason: "downloaded video cover is not a supported image"
+            }
+            .is_video_compatibility_failure()
+        );
+        assert!(
+            !TelegramError::runtime("editMessageMedia", "VIDEO_CONTENT_TYPE_INVALID")
+                .is_video_compatibility_failure()
+        );
+    }
+
+    #[test]
     fn empty_remote_media_identifier_is_not_cacheable() {
         let message = Message {
             message_id: 1,
-            date: 0,
             chat: Chat {
                 id: 1,
                 kind: ChatKind::Private,
-                title: None,
-                username: None,
-                first_name: None,
-                last_name: None,
             },
             sender: None,
             text: None,
@@ -601,11 +758,6 @@ mod tests {
             video: Some(Video {
                 file_id: String::new(),
                 file_unique_id: String::new(),
-                width: 1,
-                height: 1,
-                duration: 1,
-                file_name: None,
-                mime_type: None,
                 file_size: None,
             }),
             document: None,
