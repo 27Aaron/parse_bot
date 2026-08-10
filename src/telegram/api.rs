@@ -189,7 +189,7 @@ impl TelegramClient {
         text: &str,
         reply_markup: Option<&InlineKeyboardMarkup>,
     ) -> TelegramResult<Message> {
-        self.send_message_inner(chat_id, text, None, reply_markup)
+        self.send_message_inner(chat_id, text, None, None, reply_markup)
             .await
     }
 
@@ -206,14 +206,34 @@ impl TelegramClient {
         reply_markup: Option<&InlineKeyboardMarkup>,
     ) -> TelegramResult<Message> {
         let reply_parameters = ReplyParameters::new(reply_to_message_id);
-        self.send_message_inner(chat_id, text, Some(&reply_parameters), reply_markup)
+        self.send_message_inner(chat_id, text, None, Some(&reply_parameters), reply_markup)
             .await
+    }
+
+    /// Sends Telegram-supported HTML as a reply in the same chat.
+    pub async fn send_message_reply_html(
+        &self,
+        chat_id: i64,
+        text: &str,
+        reply_to_message_id: i64,
+        reply_markup: Option<&InlineKeyboardMarkup>,
+    ) -> TelegramResult<Message> {
+        let reply_parameters = ReplyParameters::new(reply_to_message_id);
+        self.send_message_inner(
+            chat_id,
+            text,
+            Some(HTML_PARSE_MODE),
+            Some(&reply_parameters),
+            reply_markup,
+        )
+        .await
     }
 
     async fn send_message_inner(
         &self,
         chat_id: i64,
         text: &str,
+        parse_mode: Option<&str>,
         reply_parameters: Option<&ReplyParameters>,
         reply_markup: Option<&InlineKeyboardMarkup>,
     ) -> TelegramResult<Message> {
@@ -222,6 +242,7 @@ impl TelegramClient {
             &SendMessageRequest {
                 chat_id,
                 text,
+                parse_mode,
                 reply_parameters,
                 reply_markup,
             },
@@ -237,12 +258,43 @@ impl TelegramClient {
         text: &str,
         reply_markup: Option<&InlineKeyboardMarkup>,
     ) -> TelegramResult<Message> {
+        self.edit_message_text_inner(chat_id, message_id, text, None, reply_markup)
+            .await
+    }
+
+    /// Edits a message using Telegram-supported HTML formatting.
+    pub async fn edit_message_text_html(
+        &self,
+        chat_id: i64,
+        message_id: i64,
+        text: &str,
+        reply_markup: Option<&InlineKeyboardMarkup>,
+    ) -> TelegramResult<Message> {
+        self.edit_message_text_inner(
+            chat_id,
+            message_id,
+            text,
+            Some(HTML_PARSE_MODE),
+            reply_markup,
+        )
+        .await
+    }
+
+    async fn edit_message_text_inner(
+        &self,
+        chat_id: i64,
+        message_id: i64,
+        text: &str,
+        parse_mode: Option<&str>,
+        reply_markup: Option<&InlineKeyboardMarkup>,
+    ) -> TelegramResult<Message> {
         self.call(
             "editMessageText",
             &EditMessageTextRequest {
                 chat_id,
                 message_id,
                 text,
+                parse_mode,
                 reply_markup,
             },
             None,
@@ -941,6 +993,8 @@ struct SendMessageRequest<'a> {
     chat_id: i64,
     text: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
+    parse_mode: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     reply_parameters: Option<&'a ReplyParameters>,
     #[serde(skip_serializing_if = "Option::is_none")]
     reply_markup: Option<&'a InlineKeyboardMarkup>,
@@ -951,6 +1005,8 @@ struct EditMessageTextRequest<'a> {
     chat_id: i64,
     message_id: i64,
     text: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    parse_mode: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     reply_markup: Option<&'a InlineKeyboardMarkup>,
 }
@@ -1127,14 +1183,14 @@ mod tests {
 
     #[test]
     fn serializes_inline_keyboard_and_input_files() {
-        let keyboard = InlineKeyboardMarkup::single_row(vec![
-            InlineKeyboardButton::callback("下载视频", "compatible:nonce"),
-            InlineKeyboardButton::callback("下载原视频", "original:nonce"),
-        ]);
+        let keyboard = InlineKeyboardMarkup::single_row(vec![InlineKeyboardButton::callback(
+            "操作",
+            "action:nonce",
+        )]);
         let value = serde_json::to_value(&keyboard).unwrap();
         assert_eq!(
             value["inline_keyboard"][0][0]["callback_data"],
-            "compatible:nonce"
+            "action:nonce"
         );
 
         let file_id = InputFile::file_id("cached-file-id").unwrap();
@@ -1157,6 +1213,7 @@ mod tests {
         let request = SendMessageRequest {
             chat_id: 42,
             text: "正在解析链接…",
+            parse_mode: Some(HTML_PARSE_MODE),
             reply_parameters: Some(&reply_parameters),
             reply_markup: None,
         };
@@ -1169,6 +1226,18 @@ mod tests {
         );
         assert!(value.get("reply_to_message_id").is_none());
         assert!(value.get("reply_markup").is_none());
+        assert_eq!(value["parse_mode"], "HTML");
+
+        let edit = serde_json::to_value(EditMessageTextRequest {
+            chat_id: 42,
+            message_id: 74,
+            text: "<b>▎下 载 中... | 20%</b>",
+            parse_mode: Some(HTML_PARSE_MODE),
+            reply_markup: None,
+        })
+        .unwrap();
+        assert_eq!(edit["parse_mode"], "HTML");
+        assert_eq!(edit["message_id"], 74);
     }
 
     #[test]
@@ -1209,7 +1278,7 @@ mod tests {
     }
 
     #[test]
-    fn omits_video_display_metadata_for_compatible_legacy_calls() {
+    fn omits_video_display_metadata_when_not_supplied() {
         let input = InputFile::file_id("cached-file-id").unwrap();
         let video = serde_json::to_value(SendVideoRequest {
             chat_id: 42,
