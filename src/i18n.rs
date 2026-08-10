@@ -66,6 +66,7 @@ pub enum Status {
     Downloading,
     Sending,
     Uploading,
+    WaitingForMedia,
 }
 
 pub fn status(language: Language, value: Status) -> &'static str {
@@ -74,18 +75,30 @@ pub fn status(language: Language, value: Status) -> &'static str {
         (Language::Chinese, Status::Downloading) => "<b>▎下 载 中...</b>",
         (Language::Chinese, Status::Sending) => "<b>▎发 送 中...</b>",
         (Language::Chinese, Status::Uploading) => "<b>▎上 传 中...</b>",
+        (Language::Chinese, Status::WaitingForMedia) => {
+            "<b>▎等 待 中...</b>\n\n相同视频正在处理中，完成后将直接发送。"
+        }
         (Language::English, Status::Parsing) => "<b>▎Parsing...</b>",
         (Language::English, Status::Downloading) => "<b>▎Downloading...</b>",
         (Language::English, Status::Sending) => "<b>▎Sending...</b>",
         (Language::English, Status::Uploading) => "<b>▎Uploading...</b>",
+        (Language::English, Status::WaitingForMedia) => {
+            "<b>▎Waiting...</b>\n\nThe same video is already being processed and will be sent when ready."
+        }
         (Language::Japanese, Status::Parsing) => "<b>▎解析中...</b>",
         (Language::Japanese, Status::Downloading) => "<b>▎ダウンロード中...</b>",
         (Language::Japanese, Status::Sending) => "<b>▎送信中...</b>",
         (Language::Japanese, Status::Uploading) => "<b>▎アップロード中...</b>",
+        (Language::Japanese, Status::WaitingForMedia) => {
+            "<b>▎待機中...</b>\n\n同じ動画を処理中です。完了後すぐに送信します。"
+        }
         (Language::Russian, Status::Parsing) => "<b>▎Разбор...</b>",
         (Language::Russian, Status::Downloading) => "<b>▎Загрузка...</b>",
         (Language::Russian, Status::Sending) => "<b>▎Отправка...</b>",
         (Language::Russian, Status::Uploading) => "<b>▎Загрузка в Telegram...</b>",
+        (Language::Russian, Status::WaitingForMedia) => {
+            "<b>▎Ожидание...</b>\n\nТакое же видео уже обрабатывается и будет отправлено после завершения."
+        }
     }
 }
 
@@ -400,5 +413,15 @@ mod tests {
             "▎配置面板 - 个人配置"
         );
         assert_eq!(done(Language::Chinese), "完成");
+    }
+
+    #[test]
+    fn shared_media_waiting_status_is_available_in_every_language() {
+        for language in Language::ALL {
+            let message = status(language, Status::WaitingForMedia);
+            assert!(message.starts_with("<b>"));
+            assert!(message.contains('\n'));
+            assert!(!message.is_empty());
+        }
     }
 }

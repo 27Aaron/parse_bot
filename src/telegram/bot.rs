@@ -1,25 +1,25 @@
 use std::{
     collections::{HashMap, VecDeque},
     panic::AssertUnwindSafe,
-    sync::{Arc, Mutex as StdMutex, OnceLock},
-    time::Duration,
+    sync::{Arc, Mutex as StdMutex, OnceLock, Weak},
+    time::{Duration, Instant},
 };
 
 use futures_util::FutureExt;
 use regex::{Captures, Regex};
 use tokio::{
-    sync::{Mutex, Semaphore, mpsc},
+    sync::{Mutex, OwnedMutexGuard, Semaphore, mpsc},
     task::AbortHandle,
 };
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
-use tracing::{error, info, warn};
+use tracing::{Instrument, error, info, info_span, warn};
 
 use crate::{
     AppError, Result,
     i18n::{self, Language, Status},
     media::{DownloadedMedia, MediaDownloader, MediaProbe, decrypt_file_prefix, probe_media},
     model::{MediaSource, ResolvedPost, TelegramMediaKind, VideoCodec},
-    storage::{MediaCache, UserSettings},
+    storage::{CachedTelegramMedia, MediaCache, UserSettings},
     telegram::api::{
         BotCommand, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, InputFile, Message,
         TelegramClient, TelegramError, Update, VideoMetadata, escape_html,
@@ -37,6 +37,70 @@ const MAX_WAITING_TASKS_PER_USER: usize = 3;
 const MAX_WAITING_TASKS: usize = 100;
 const MEDIA_PIPELINE_CONCURRENCY: usize = MAX_ACTIVE_TASKS;
 const INBOUND_LOG_PREVIEW_CHARS: usize = 240;
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct MediaFlightKey {
+    platform: String,
+    post_id: String,
+}
+
+impl MediaFlightKey {
+    fn new(platform: &str, post_id: &str) -> Self {
+        Self {
+            platform: platform.to_owned(),
+            post_id: post_id.to_owned(),
+        }
+    }
+}
+
+#[derive(Default)]
+struct MediaFlightLocks {
+    locks: StdMutex<HashMap<MediaFlightKey, Weak<Mutex<()>>>>,
+}
+
+impl MediaFlightLocks {
+    fn flight(&self, key: MediaFlightKey) -> MediaFlight {
+        let mut locks = self
+            .locks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Weak values keep completed posts from retaining one mutex forever.
+        // Prune dead keys while this small map is already exclusively held.
+        locks.retain(|_, lock| lock.strong_count() > 0);
+        let lock = locks.get(&key).and_then(Weak::upgrade).unwrap_or_else(|| {
+            let lock = Arc::new(Mutex::new(()));
+            locks.insert(key, Arc::downgrade(&lock));
+            lock
+        });
+        MediaFlight { lock }
+    }
+
+    #[cfg(test)]
+    fn entry_count(&self) -> usize {
+        self.locks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len()
+    }
+}
+
+struct MediaFlight {
+    lock: Arc<Mutex<()>>,
+}
+
+impl MediaFlight {
+    fn try_acquire(&self) -> Option<OwnedMutexGuard<()>> {
+        self.lock.clone().try_lock_owned().ok()
+    }
+
+    async fn acquire(&self, cancellation: &CancellationToken) -> Option<OwnedMutexGuard<()>> {
+        tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => None,
+            guard = self.lock.clone().lock_owned() => Some(guard),
+        }
+    }
+}
 
 fn log_inbound_update(update: &Update) {
     if let Some(callback) = update.callback_query.as_ref() {
@@ -241,9 +305,52 @@ fn sanitize_inbound_url(value: &str) -> String {
     sanitized
 }
 
-fn safe_callback_action(data: &str) -> Option<&'static str> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SettingCallback {
+    owner_id: u64,
+    action: SettingAction,
+}
+
+impl SettingCallback {
+    const fn is_owned_by(self, user_id: u64) -> bool {
+        self.owner_id == user_id
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SettingAction {
+    Main,
+    Done,
+    Language,
+    SetLanguage(Language),
+    ToggleSource,
+    ToggleProgress,
+    ToggleReply,
+    ToggleCover,
+}
+
+impl SettingAction {
+    const fn log_name(self) -> &'static str {
+        match self {
+            Self::Main => "main",
+            Self::Done => "done",
+            Self::Language => "language",
+            Self::SetLanguage(_) => "lang",
+            Self::ToggleSource => "source",
+            Self::ToggleProgress => "progress",
+            Self::ToggleReply => "reply",
+            Self::ToggleCover => "cover",
+        }
+    }
+}
+
+fn parse_setting_callback(data: &str) -> Option<SettingCallback> {
     let mut parts = data.split('|');
-    if parts.next()? != "setting" || parts.next()?.parse::<u64>().is_err() {
+    if parts.next()? != "setting" {
+        return None;
+    }
+    let owner_id = parts.next()?.parse::<u64>().ok()?;
+    if owner_id == 0 {
         return None;
     }
     let action = parts.next()?;
@@ -251,17 +358,22 @@ fn safe_callback_action(data: &str) -> Option<&'static str> {
     if parts.next().is_some() {
         return None;
     }
-    match (action, argument) {
-        ("main", None) => Some("main"),
-        ("done", None) => Some("done"),
-        ("language", None) => Some("language"),
-        ("source", None) => Some("source"),
-        ("progress", None) => Some("progress"),
-        ("reply", None) => Some("reply"),
-        ("cover", None) => Some("cover"),
-        ("lang", Some(code)) if Language::from_code(code).is_some() => Some("lang"),
-        _ => None,
-    }
+    let action = match (action, argument) {
+        ("main", None) => SettingAction::Main,
+        ("done", None) => SettingAction::Done,
+        ("language", None) => SettingAction::Language,
+        ("source", None) => SettingAction::ToggleSource,
+        ("progress", None) => SettingAction::ToggleProgress,
+        ("reply", None) => SettingAction::ToggleReply,
+        ("cover", None) => SettingAction::ToggleCover,
+        ("lang", Some(code)) => SettingAction::SetLanguage(Language::from_code(code)?),
+        _ => return None,
+    };
+    Some(SettingCallback { owner_id, action })
+}
+
+fn safe_callback_action(data: &str) -> Option<&'static str> {
+    parse_setting_callback(data).map(|callback| callback.action.log_name())
 }
 
 #[derive(Clone)]
@@ -273,6 +385,7 @@ pub struct BotService {
     required_channel_id: Option<Arc<str>>,
     scheduler: Arc<Mutex<SchedulerState>>,
     media_slots: Arc<Semaphore>,
+    media_flights: Arc<MediaFlightLocks>,
     background_tasks: TaskTracker,
     task_abort_handles: Arc<StdMutex<Vec<AbortHandle>>>,
 }
@@ -594,6 +707,7 @@ impl BotService {
             required_channel_id: required_channel_id.map(Arc::from),
             scheduler: Arc::new(Mutex::new(SchedulerState::new())),
             media_slots: Arc::new(Semaphore::new(MEDIA_PIPELINE_CONCURRENCY)),
+            media_flights: Arc::new(MediaFlightLocks::default()),
             background_tasks: TaskTracker::new(),
             task_abort_handles: Arc::new(StdMutex::new(Vec::new())),
         }
@@ -683,7 +797,10 @@ impl BotService {
         if let Some(callback) = update.callback_query {
             return self.handle_callback(callback, shutdown).await;
         }
-        if let Some(message) = update.message.filter(|message| message.text.is_some()) {
+        if let Some(message) = update
+            .message
+            .filter(|message| message_input(message).is_some())
+        {
             return self.handle_message(message, shutdown).await;
         }
         Ok(())
@@ -721,7 +838,8 @@ impl BotService {
             .await;
             return Ok(());
         }
-        let Some(data) = callback.data.as_deref() else {
+        let Some(setting_callback) = callback.data.as_deref().and_then(parse_setting_callback)
+        else {
             self.answer_callback(
                 &callback.id,
                 Some(i18n::invalid_setting(preferences.language)),
@@ -730,10 +848,7 @@ impl BotService {
             .await;
             return Ok(());
         };
-        let parts = data.split('|').collect::<Vec<_>>();
-        let valid_prefix = parts.first() == Some(&"setting") && parts.len() >= 3;
-        let owner_id = parts.get(1).and_then(|value| value.parse::<u64>().ok());
-        if !valid_prefix || owner_id != Some(callback.sender.id) {
+        if !setting_callback.is_owned_by(callback.sender.id) {
             self.answer_callback(
                 &callback.id,
                 Some(i18n::invalid_setting(preferences.language)),
@@ -748,14 +863,14 @@ impl BotService {
             .get_user_settings_with_default(callback.sender.id, callback_language)
             .await
             .unwrap_or_default();
-        let action = parts[2];
         let mut notice = None;
-        match action {
-            "main" => {}
-            "done" => {
+        match setting_callback.action {
+            SettingAction::Main => {}
+            SettingAction::Done => {
                 let referenced_message_id = message
                     .reply_to_message
                     .as_deref()
+                    .filter(|reply| is_settings_command_message(reply))
                     .map(|reply| reply.message_id);
                 let result = tokio::select! {
                     _ = shutdown.cancelled() => return Ok(()),
@@ -783,7 +898,7 @@ impl BotService {
                 self.answer_callback(&callback.id, None, false).await;
                 return Ok(());
             }
-            "language" => {
+            SettingAction::Language => {
                 let text = format!(
                     "<b>{}</b>\n\n{}",
                     i18n::settings_panel_title(settings.language),
@@ -803,59 +918,40 @@ impl BotService {
                 self.answer_callback(&callback.id, None, false).await;
                 return Ok(());
             }
-            "lang" => {
-                let Some(language_code) = parts.get(3).and_then(|value| Language::from_code(value))
-                else {
-                    self.answer_callback(
-                        &callback.id,
-                        Some(i18n::invalid_setting(settings.language)),
-                        true,
-                    )
-                    .await;
-                    return Ok(());
-                };
-                settings.language = language_code;
-                notice = Some(i18n::settings_saved(language_code));
+            SettingAction::SetLanguage(language) => {
+                settings.language = language;
+                notice = Some(i18n::settings_saved(language));
                 self.cache
                     .put_user_settings(callback.sender.id, settings)
                     .await?;
             }
-            "source" => {
+            SettingAction::ToggleSource => {
                 settings.show_source = !settings.show_source;
                 notice = Some(i18n::settings_saved(settings.language));
                 self.cache
                     .put_user_settings(callback.sender.id, settings)
                     .await?;
             }
-            "progress" => {
+            SettingAction::ToggleProgress => {
                 settings.show_progress = !settings.show_progress;
                 notice = Some(i18n::settings_saved(settings.language));
                 self.cache
                     .put_user_settings(callback.sender.id, settings)
                     .await?;
             }
-            "reply" => {
+            SettingAction::ToggleReply => {
                 settings.reply_to_source = !settings.reply_to_source;
                 notice = Some(i18n::settings_saved(settings.language));
                 self.cache
                     .put_user_settings(callback.sender.id, settings)
                     .await?;
             }
-            "cover" => {
+            SettingAction::ToggleCover => {
                 settings.show_video_cover = !settings.show_video_cover;
                 notice = Some(i18n::settings_saved(settings.language));
                 self.cache
                     .put_user_settings(callback.sender.id, settings)
                     .await?;
-            }
-            _ => {
-                self.answer_callback(
-                    &callback.id,
-                    Some(i18n::invalid_setting(settings.language)),
-                    true,
-                )
-                .await;
-                return Ok(());
             }
         }
 
@@ -947,9 +1043,12 @@ impl BotService {
             return Ok(());
         }
 
-        let text = message.text.as_deref().unwrap_or_default().trim();
-        match command_name(text) {
-            Some("start") => {
+        let text = message_input(&message).unwrap_or_default().trim();
+        // Commands are valid only as text messages. Captions may carry share
+        // links, but must never make a settings panel target user media.
+        let command = message_command(&message);
+        match command {
+            Some("start" | "help") => {
                 let help =
                     i18n::start_text(preferences.language, self.required_channel_id.as_deref());
                 tokio::select! {
@@ -964,7 +1063,7 @@ impl BotService {
                     }
                 }
             }
-            Some("setting") => {
+            Some("setting" | "settings") => {
                 let (panel, keyboard) = settings_panel(preferences.language, preferences, user_id);
                 tokio::select! {
                     _ = shutdown.cancelled() => {}
@@ -1174,27 +1273,51 @@ impl BotService {
         let service = self.clone();
         let task_id = task.task_id;
         let user_id = task.user_id;
-        let handle = self.background_tasks.spawn(async move {
-            let result = AssertUnwindSafe(service.process_parse_task(&task))
-                .catch_unwind()
-                .await;
-            let dispatched = {
-                let mut state = service.scheduler.lock().await;
-                let task_ids = state.scheduler.complete(task_id, user_id);
-                state.take_dispatched(task_ids)
-            };
+        let chat_id = task.chat_id;
+        let source_message_id = task.source_message_id;
+        let span = info_span!("parse_task", task_id, user_id, chat_id, source_message_id);
+        let handle = self.background_tasks.spawn(
+            async move {
+                let started = Instant::now();
+                info!(event = "parse_task_start", "视频任务开始");
+                let result = AssertUnwindSafe(service.process_parse_task(&task))
+                    .catch_unwind()
+                    .await;
+                let dispatched = {
+                    let mut state = service.scheduler.lock().await;
+                    let task_ids = state.scheduler.complete(task_id, user_id);
+                    state.take_dispatched(task_ids)
+                };
+                let elapsed_ms = duration_millis(started.elapsed());
 
-            match result {
-                Ok(Err(error)) if !matches!(error, AppError::Cancelled) => {
-                    error!(task_id, user_id, error = %error, "视频任务失败");
+                match result {
+                    Ok(Ok(())) => {
+                        info!(event = "parse_task_success", elapsed_ms, "视频任务完成");
+                    }
+                    Ok(Err(AppError::Cancelled)) => {
+                        info!(event = "parse_task_cancel", elapsed_ms, "视频任务已取消");
+                    }
+                    Ok(Err(error)) => {
+                        error!(
+                            event = "parse_task_failure",
+                            elapsed_ms,
+                            error_kind = app_error_kind(&error),
+                            "视频任务失败"
+                        );
+                    }
+                    Err(_) => {
+                        error!(
+                            event = "parse_task_failure",
+                            elapsed_ms,
+                            error_kind = "panic",
+                            "视频任务异常终止，调度名额已释放"
+                        );
+                    }
                 }
-                Err(_) => {
-                    error!(task_id, user_id, "视频任务异常终止，调度名额已释放");
-                }
-                _ => {}
+                service.spawn_parse_tasks(dispatched);
             }
-            service.spawn_parse_tasks(dispatched);
-        });
+            .instrument(span),
+        );
         let abort_handle = handle.abort_handle();
         drop(handle);
         let mut abort_handles = self
@@ -1346,59 +1469,54 @@ impl BotService {
         } else {
             None
         };
-        if let Some(cached) = self
-            .cache
-            .get(&task.post.platform, &task.post.post_id)
+        if self
+            .try_send_cached_media(task, &caption, cover.as_ref(), cancellation)
             .await?
         {
-            self.update_status_html(
-                task,
-                i18n::status(task.preferences.language, Status::Sending),
-                cancellation,
-            )
-            .await;
-            let input = InputFile::file_id(cached.file_id.clone())?;
-            let cached_edit = tokio::select! {
-                _ = cancellation.cancelled() => return Err(AppError::Cancelled),
-                result = self.edit_media(
-                    task.chat_id,
-                    task.status_message_id,
-                    cached.kind,
-                    &input,
-                    &caption,
-                    None,
-                    cover.as_ref(),
-                ) => result,
-            };
-            let cached_edit = if cached.kind == TelegramMediaKind::Video
-                && cover.is_some()
-                && cached_edit.is_err()
-            {
-                tokio::select! {
-                    _ = cancellation.cancelled() => return Err(AppError::Cancelled),
-                    result = self.edit_media(
-                        task.chat_id,
-                        task.status_message_id,
-                        cached.kind,
-                        &input,
-                        &caption,
-                        None,
-                        None,
-                    ) => result,
-                }
-            } else {
-                cached_edit
-            };
-            match cached_edit {
-                Ok(_) => return Ok(()),
-                Err(error) if error.error_code() == Some(400) => {
-                    self.cache
-                        .remove(&task.post.platform, &task.post.post_id)
-                        .await?;
-                }
-                Err(error) => return Err(error.into()),
-            }
+            return Ok(());
         }
+
+        let flight_guard = loop {
+            let flight = self
+                .media_flights
+                .flight(MediaFlightKey::new(&task.post.platform, &task.post.post_id));
+            let guard = match flight.try_acquire() {
+                Some(guard) => guard,
+                None => {
+                    self.update_status_html(
+                        task,
+                        i18n::status(task.preferences.language, Status::WaitingForMedia),
+                        cancellation,
+                    )
+                    .await;
+                    flight
+                        .acquire(cancellation)
+                        .await
+                        .ok_or(AppError::Cancelled)?
+                }
+            };
+
+            // The leader may have populated the cache while this task waited.
+            // Release the flight before doing cover I/O or Telegram network
+            // work so all followers can send the cached file concurrently.
+            if let Some(cached) = self
+                .cache
+                .get(&task.post.platform, &task.post.post_id)
+                .await?
+            {
+                drop(guard);
+                if self
+                    .try_send_cached_entry(task, &caption, cover.as_ref(), cancellation, cached)
+                    .await?
+                {
+                    return Ok(());
+                }
+                // A stale file_id was removed conditionally. Re-enter the
+                // flight so exactly one waiter becomes the replacement leader.
+                continue;
+            }
+            break guard;
+        };
 
         let mut source = task.post.video.clone();
         let _permit = tokio::select! {
@@ -1484,23 +1602,25 @@ impl BotService {
                     cover.as_ref(),
                 ) => result,
             };
-            let edit_result =
-                if kind == TelegramMediaKind::Video && cover.is_some() && edit_result.is_err() {
-                    tokio::select! {
-                        _ = cancellation.cancelled() => return Err(AppError::Cancelled),
-                        result = self.edit_media(
-                            task.chat_id,
-                            task.status_message_id,
-                            kind,
-                            &input,
-                            &caption,
-                            Some(video_metadata),
-                            None,
-                        ) => result,
-                    }
-                } else {
-                    edit_result
-                };
+            let edit_result = if kind == TelegramMediaKind::Video
+                && cover.is_some()
+                && matches!(&edit_result, Err(error) if error.is_cover_failure())
+            {
+                tokio::select! {
+                    _ = cancellation.cancelled() => return Err(AppError::Cancelled),
+                    result = self.edit_media(
+                        task.chat_id,
+                        task.status_message_id,
+                        kind,
+                        &input,
+                        &caption,
+                        Some(video_metadata),
+                        None,
+                    ) => result,
+                }
+            } else {
+                edit_result
+            };
             let edited = match edit_result {
                 Ok(message) => message,
                 Err(error)
@@ -1543,10 +1663,89 @@ impl BotService {
         }
         .await;
 
+        // Upload and the cache write are complete at this point. Let followers
+        // reuse the cache while the leader removes its temporary file.
+        drop(flight_guard);
         if let Err(error) = downloaded.cleanup().await {
             warn!(error = %error, "临时媒体文件清理失败");
         }
         result
+    }
+
+    async fn try_send_cached_media(
+        &self,
+        task: &MediaTask,
+        caption: &str,
+        cover: Option<&InputFile>,
+        cancellation: &CancellationToken,
+    ) -> Result<bool> {
+        let Some(cached) = self
+            .cache
+            .get(&task.post.platform, &task.post.post_id)
+            .await?
+        else {
+            return Ok(false);
+        };
+        self.try_send_cached_entry(task, caption, cover, cancellation, cached)
+            .await
+    }
+
+    async fn try_send_cached_entry(
+        &self,
+        task: &MediaTask,
+        caption: &str,
+        cover: Option<&InputFile>,
+        cancellation: &CancellationToken,
+        cached: CachedTelegramMedia,
+    ) -> Result<bool> {
+        self.update_status_html(
+            task,
+            i18n::status(task.preferences.language, Status::Sending),
+            cancellation,
+        )
+        .await;
+        let input = InputFile::file_id(cached.file_id.clone())?;
+        let cached_edit = tokio::select! {
+            _ = cancellation.cancelled() => return Err(AppError::Cancelled),
+            result = self.edit_media(
+                task.chat_id,
+                task.status_message_id,
+                cached.kind,
+                &input,
+                caption,
+                None,
+                cover,
+            ) => result,
+        };
+        let cached_edit = if cached.kind == TelegramMediaKind::Video
+            && cover.is_some()
+            && matches!(&cached_edit, Err(error) if error.is_cover_failure())
+        {
+            tokio::select! {
+                _ = cancellation.cancelled() => return Err(AppError::Cancelled),
+                result = self.edit_media(
+                    task.chat_id,
+                    task.status_message_id,
+                    cached.kind,
+                    &input,
+                    caption,
+                    None,
+                    None,
+                ) => result,
+            }
+        } else {
+            cached_edit
+        };
+        match cached_edit {
+            Ok(_) => Ok(true),
+            Err(error) if error.error_code() == Some(400) => {
+                self.cache
+                    .remove_if_file_id(&task.post.platform, &task.post.post_id, &cached.file_id)
+                    .await?;
+                Ok(false)
+            }
+            Err(error) => Err(error.into()),
+        }
     }
 
     async fn download_with_status(
@@ -1763,11 +1962,59 @@ impl BotService {
     }
 }
 
+fn duration_millis(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
+fn app_error_kind(error: &AppError) -> &'static str {
+    match error {
+        AppError::Config(_) => "config",
+        AppError::UnsupportedUrl => "unsupported_url",
+        AppError::LoginRequired => "login_required",
+        AppError::NotFound => "not_found",
+        AppError::MediaUnavailable => "media_unavailable",
+        AppError::UpstreamChanged => "upstream_changed",
+        AppError::RateLimited => "rate_limited",
+        AppError::Network(_) => "network",
+        AppError::Download(_) => "download",
+        AppError::InvalidMedia(_) => "invalid_media",
+        AppError::MediaTooLarge { .. } => "media_too_large",
+        AppError::Storage(_) => "storage",
+        AppError::Telegram(_) => "telegram",
+        AppError::Expired => "expired",
+        AppError::Cancelled => "cancelled",
+        AppError::Database(_) => "database",
+        AppError::Io(_) => "io",
+        AppError::Json(_) => "json",
+        AppError::Url(_) => "url",
+    }
+}
+
+fn message_input(message: &Message) -> Option<&str> {
+    preferred_message_input(message.text.as_deref(), message.caption.as_deref())
+}
+
+fn preferred_message_input<'a>(text: Option<&'a str>, caption: Option<&'a str>) -> Option<&'a str> {
+    text.or(caption)
+}
+
 fn command_name(text: &str) -> Option<&str> {
     text.split_whitespace()
         .next()
         .and_then(|value| value.strip_prefix('/'))
         .map(|value| value.split('@').next().unwrap_or(value))
+}
+
+fn message_command(message: &Message) -> Option<&str> {
+    message
+        .text
+        .as_deref()
+        .map(str::trim)
+        .and_then(command_name)
+}
+
+fn is_settings_command_message(message: &Message) -> bool {
+    message_command(message).is_some_and(|command| matches!(command, "setting" | "settings"))
 }
 
 fn telegram_media_kind(codec: VideoCodec) -> TelegramMediaKind {
@@ -1904,12 +2151,59 @@ mod tests {
     use super::*;
 
     #[test]
-    fn recognizes_only_start_as_the_supported_command() {
+    fn recognizes_commands_and_aliases() {
         assert_eq!(command_name("/start"), Some("start"));
         assert_eq!(command_name("/start@parse_bot"), Some("start"));
+        assert_eq!(command_name("/help"), Some("help"));
         assert_eq!(command_name("/setting"), Some("setting"));
-        assert_ne!(command_name("/unknown"), Some("start"));
+        assert_eq!(command_name("/settings@parse_bot"), Some("settings"));
+        assert_eq!(command_name("/unknown"), Some("unknown"));
         assert_eq!(command_name("https://weixin.qq.com/sph/example"), None);
+    }
+
+    #[test]
+    fn prefers_message_text_and_falls_back_to_caption() {
+        assert_eq!(
+            preferred_message_input(Some("text link"), Some("caption link")),
+            Some("text link")
+        );
+        assert_eq!(
+            preferred_message_input(None, Some("caption link")),
+            Some("caption link")
+        );
+        assert_eq!(preferred_message_input(Some(""), Some("caption")), Some(""));
+        assert_eq!(preferred_message_input(None, None), None);
+    }
+
+    #[test]
+    fn media_captions_are_inputs_but_never_commands_or_deletion_targets() {
+        let message = |text: Option<&str>, caption: Option<&str>| Message {
+            message_id: 1,
+            date: 0,
+            chat: crate::telegram::api::Chat {
+                id: 1,
+                kind: crate::telegram::api::ChatKind::Private,
+                title: None,
+                username: None,
+                first_name: None,
+                last_name: None,
+            },
+            sender: None,
+            text: text.map(str::to_owned),
+            caption: caption.map(str::to_owned),
+            reply_to_message: None,
+            video: None,
+            document: None,
+        };
+
+        let caption_command = message(None, Some("/settings"));
+        assert_eq!(message_input(&caption_command), Some("/settings"));
+        assert_eq!(message_command(&caption_command), None);
+        assert!(!is_settings_command_message(&caption_command));
+
+        let text_command = message(Some("/settings@parse_bot"), None);
+        assert_eq!(message_command(&text_command), Some("settings"));
+        assert!(is_settings_command_message(&text_command));
     }
 
     #[test]
@@ -1987,6 +2281,146 @@ mod tests {
         assert_eq!(safe_callback_action("setting|42|lang|invalid"), None);
         assert_eq!(safe_callback_action("setting|42|source|private"), None);
         assert_eq!(safe_callback_action("secret|42|token"), None);
+    }
+
+    #[test]
+    fn strictly_parses_setting_callbacks_and_ownership() {
+        let source = parse_setting_callback("setting|42|source").unwrap();
+        assert_eq!(source.owner_id, 42);
+        assert_eq!(source.action, SettingAction::ToggleSource);
+        assert!(source.is_owned_by(42));
+        assert!(!source.is_owned_by(7));
+
+        assert_eq!(
+            parse_setting_callback("setting|42|lang|ja"),
+            Some(SettingCallback {
+                owner_id: 42,
+                action: SettingAction::SetLanguage(Language::Japanese),
+            })
+        );
+        for invalid in [
+            "",
+            "setting",
+            "setting||source",
+            "setting|not-a-user|source",
+            "setting|0|source",
+            "setting|42",
+            "setting|42|",
+            "setting|42|unknown",
+            "setting|42|source|extra",
+            "setting|42|lang",
+            "setting|42|lang|invalid",
+            "setting|42|lang|en|extra",
+            "other|42|source",
+        ] {
+            assert_eq!(
+                parse_setting_callback(invalid),
+                None,
+                "unexpected valid callback: {invalid}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn media_singleflight_runs_one_leader_after_concurrent_misses() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        const TASKS: usize = 12;
+        let flights = Arc::new(MediaFlightLocks::default());
+        let cache_filled = Arc::new(Mutex::new(false));
+        let leader_runs = Arc::new(AtomicUsize::new(0));
+        let barrier = Arc::new(tokio::sync::Barrier::new(TASKS));
+        let mut handles = Vec::with_capacity(TASKS);
+
+        for _ in 0..TASKS {
+            let flights = flights.clone();
+            let cache_filled = cache_filled.clone();
+            let leader_runs = leader_runs.clone();
+            let barrier = barrier.clone();
+            handles.push(tokio::spawn(async move {
+                barrier.wait().await;
+                if *cache_filled.lock().await {
+                    return;
+                }
+
+                let flight = flights.flight(MediaFlightKey::new("wechat_channels", "post-1"));
+                let cancellation = CancellationToken::new();
+                let _guard = match flight.try_acquire() {
+                    Some(guard) => guard,
+                    None => flight.acquire(&cancellation).await.unwrap(),
+                };
+                if *cache_filled.lock().await {
+                    return;
+                }
+
+                leader_runs.fetch_add(1, Ordering::SeqCst);
+                tokio::task::yield_now().await;
+                *cache_filled.lock().await = true;
+            }));
+        }
+
+        for handle in handles {
+            handle.await.unwrap();
+        }
+        assert_eq!(leader_runs.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn media_singleflight_wait_is_cancellable_and_failed_leader_does_not_poison_lock() {
+        let flights = MediaFlightLocks::default();
+        let key = MediaFlightKey::new("wechat_channels", "post-2");
+        let leader_flight = flights.flight(key.clone());
+        let leader_guard = leader_flight.try_acquire().unwrap();
+
+        let cancelled_flight = flights.flight(key.clone());
+        let cancellation = CancellationToken::new();
+        let wait = cancelled_flight.acquire(&cancellation);
+        tokio::pin!(wait);
+        tokio::task::yield_now().await;
+        cancellation.cancel();
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), &mut wait)
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        // Dropping a leader without publishing a result models a failed media
+        // pipeline. The next waiter must be able to take over immediately.
+        drop(leader_guard);
+        let successor = flights.flight(key);
+        assert!(successor.try_acquire().is_some());
+    }
+
+    #[test]
+    fn media_singleflight_uses_independent_keys_and_prunes_dead_entries() {
+        let flights = MediaFlightLocks::default();
+        let first = flights.flight(MediaFlightKey::new("wechat_channels", "post-1"));
+        let first_guard = first.try_acquire().unwrap();
+        let second = flights.flight(MediaFlightKey::new("wechat_channels", "post-2"));
+        assert!(second.try_acquire().is_some());
+        assert_eq!(flights.entry_count(), 2);
+
+        drop(first_guard);
+        drop(first);
+        drop(second);
+        let _replacement = flights.flight(MediaFlightKey::new("wechat_channels", "post-3"));
+        assert_eq!(flights.entry_count(), 1);
+    }
+
+    #[test]
+    fn task_failure_logs_use_safe_error_categories() {
+        assert_eq!(
+            app_error_kind(&AppError::Network(
+                "https://example.test/video?token=private".into()
+            )),
+            "network"
+        );
+        assert_eq!(
+            app_error_kind(&AppError::Telegram("file_id=private".into())),
+            "telegram"
+        );
+        assert_eq!(app_error_kind(&AppError::Cancelled), "cancelled");
     }
 
     #[test]
