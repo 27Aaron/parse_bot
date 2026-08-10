@@ -136,11 +136,52 @@ impl MediaDownloader {
         })
     }
 
+    /// Return a downloader that shares this instance's storage and network
+    /// policy while enforcing an equal or stricter byte limit.
+    ///
+    /// This is intended for callers that need to fetch a smaller auxiliary
+    /// asset without constructing a second HTTP client policy. Asking for a
+    /// larger limit never weakens the original downloader's cap.
+    pub(crate) fn capped(&self, max_bytes: u64) -> Result<Self> {
+        if max_bytes == 0 {
+            return Err(AppError::Config("媒体下载大小上限必须大于零".to_owned()));
+        }
+
+        Ok(Self {
+            shared_dir: Arc::clone(&self.shared_dir),
+            max_bytes: self.max_bytes.min(max_bytes),
+            allowed_hosts: Arc::clone(&self.allowed_hosts),
+            request_timeout: self.request_timeout,
+        })
+    }
+
+    /// Return a downloader with stricter byte and request-duration limits.
+    pub(crate) fn capped_with_timeout(
+        &self,
+        max_bytes: u64,
+        request_timeout: Duration,
+    ) -> Result<Self> {
+        if request_timeout.is_zero() {
+            return Err(AppError::Config("媒体下载超时必须大于零".to_owned()));
+        }
+        let mut downloader = self.capped(max_bytes)?;
+        downloader.request_timeout = downloader.request_timeout.min(request_timeout);
+        Ok(downloader)
+    }
+
     /// Download a resolved media source. Its parser-provided size hint is an
     /// early limit only; Content-Length and streamed bytes are checked again.
     pub async fn download(&self, source: &MediaSource) -> Result<DownloadedMedia> {
         self.download_url_with_callback(&source.url, source.size_hint, None)
             .await
+    }
+
+    /// Download a URL without a parser-provided size hint.
+    ///
+    /// The request still passes through the downloader's host allowlist, DNS
+    /// pinning, redirect validation, timeout, and streaming byte limit.
+    pub(crate) async fn download_url(&self, url: &Url) -> Result<DownloadedMedia> {
+        self.download_url_with_callback(url, None, None).await
     }
 
     /// Download a resolved media source and report actual on-disk progress.
@@ -754,6 +795,83 @@ mod tests {
             let url = Url::parse(raw).unwrap();
             assert!(validate_media_url(&url, &allowed).is_err(), "{raw}");
         }
+    }
+
+    #[test]
+    fn capped_downloader_preserves_policy_and_only_tightens_limit() {
+        let downloader = MediaDownloader::with_options(
+            "media",
+            100,
+            HashSet::from(["EXAMPLE.COM".to_owned()]),
+            Duration::from_secs(17),
+        )
+        .unwrap();
+
+        let tighter = downloader.capped(25).unwrap();
+        assert_eq!(tighter.max_bytes, 25);
+        assert_eq!(tighter.shared_dir, downloader.shared_dir);
+        assert_eq!(tighter.allowed_hosts, downloader.allowed_hosts);
+        assert_eq!(tighter.request_timeout, downloader.request_timeout);
+        assert!(Arc::ptr_eq(&tighter.shared_dir, &downloader.shared_dir));
+        assert!(Arc::ptr_eq(
+            &tighter.allowed_hosts,
+            &downloader.allowed_hosts
+        ));
+
+        let requested_expansion = downloader.capped(1_000).unwrap();
+        assert_eq!(requested_expansion.max_bytes, 100);
+    }
+
+    #[test]
+    fn capped_downloader_rejects_zero_limit() {
+        let downloader = MediaDownloader::with_options(
+            "media",
+            100,
+            HashSet::from(["example.com".to_owned()]),
+            Duration::from_secs(17),
+        )
+        .unwrap();
+
+        assert!(matches!(downloader.capped(0), Err(AppError::Config(_))));
+    }
+
+    #[test]
+    fn capped_downloader_can_also_tighten_the_timeout() {
+        let downloader = MediaDownloader::with_options(
+            "media",
+            100,
+            HashSet::from(["example.com".to_owned()]),
+            Duration::from_secs(120),
+        )
+        .unwrap();
+
+        let tighter = downloader
+            .capped_with_timeout(25, Duration::from_secs(30))
+            .unwrap();
+        assert_eq!(tighter.max_bytes, 25);
+        assert_eq!(tighter.request_timeout, Duration::from_secs(30));
+
+        let unchanged = downloader
+            .capped_with_timeout(1_000, Duration::from_secs(300))
+            .unwrap();
+        assert_eq!(unchanged.max_bytes, 100);
+        assert_eq!(unchanged.request_timeout, Duration::from_secs(120));
+        assert!(downloader.capped_with_timeout(25, Duration::ZERO).is_err());
+    }
+
+    #[tokio::test]
+    async fn direct_url_download_still_rejects_disallowed_hosts_before_network_io() {
+        let downloader = MediaDownloader::with_options(
+            "media",
+            100,
+            HashSet::from(["allowed.example".to_owned()]),
+            Duration::from_secs(17),
+        )
+        .unwrap();
+        let disallowed = Url::parse("https://127.0.0.1/cover.jpg").unwrap();
+
+        let error = downloader.download_url(&disallowed).await.unwrap_err();
+        assert!(matches!(error, AppError::Download(_)));
     }
 
     #[test]

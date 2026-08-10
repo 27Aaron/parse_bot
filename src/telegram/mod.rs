@@ -1,5 +1,6 @@
 pub mod api;
 pub mod bot;
+mod tdlib;
 
-pub use api::TelegramClient;
 pub use bot::BotService;
+pub use tdlib::{TdlibConfig, TelegramClient};

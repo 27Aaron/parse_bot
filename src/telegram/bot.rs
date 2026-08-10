@@ -26,9 +26,9 @@ use crate::{
     wechat::{WechatResolver, extract_share_url},
 };
 
-const UPDATE_TIMEOUT_SECS: u32 = 30;
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(30);
 const FORCED_SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
+const COMMAND_CONFIGURATION_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_ACTIVE_TASKS: usize = 10;
 const MAX_WAITING_TASKS_PER_USER: usize = 3;
 const MAX_WAITING_TASKS: usize = 100;
@@ -381,33 +381,30 @@ impl BotService {
             }
             result = self.telegram.get_me() => result.map_err(AppError::from)?,
         };
-        info!(bot_id = me.id, username = ?me.username, "Telegram Bot API 已连接");
-        self.configure_commands().await;
+        info!(bot_id = me.id, username = ?me.username, "TDLib 已连接");
+        self.configure_commands(&shutdown).await;
 
-        let mut offset = None;
-        'polling: loop {
-            let updates = tokio::select! {
-                _ = shutdown.cancelled() => break 'polling,
-                result = self.telegram.get_updates(offset, UPDATE_TIMEOUT_SECS) => result,
+        'receiving: loop {
+            let update = tokio::select! {
+                _ = shutdown.cancelled() => break 'receiving,
+                result = self.telegram.next_update() => result,
             };
-            match updates {
-                Ok(updates) => {
-                    for update in updates {
-                        if shutdown.is_cancelled() {
-                            break 'polling;
-                        }
-                        let next_offset = update.update_id.saturating_add(1);
-                        if let Err(error) = self.handle_update(update, &shutdown).await {
-                            error!(error = %error, "处理 Telegram update 失败");
-                        }
-                        offset = Some(next_offset);
+            match update {
+                Ok(update) => {
+                    if let Err(error) = self.handle_update(update, &shutdown).await {
+                        error!(error = %error, "处理 Telegram update 失败");
                     }
+                }
+                Err(error) if error.is_terminal() => {
+                    shutdown.cancel();
+                    self.shutdown_background_tasks(&shutdown).await;
+                    return Err(AppError::from(error));
                 }
                 Err(error) => {
                     let delay = error.retry_after().unwrap_or(Duration::from_secs(2));
                     warn!(error = %error, ?delay, "获取 Telegram updates 失败");
                     tokio::select! {
-                        _ = shutdown.cancelled() => break 'polling,
+                        _ = shutdown.cancelled() => break 'receiving,
                         _ = tokio::time::sleep(delay) => {}
                     }
                 }
@@ -418,7 +415,7 @@ impl BotService {
         Ok(())
     }
 
-    async fn configure_commands(&self) {
+    async fn configure_commands(&self, shutdown: &CancellationToken) {
         // Telegram chooses the most specific command set matching the user's
         // language.  The default is Chinese, while the other three sets keep
         // the command menu useful before a user opens the settings panel.
@@ -432,16 +429,25 @@ impl BotService {
                 BotCommand::new("start", i18n::command_start(language)),
                 BotCommand::new("setting", i18n::command_setting(language)),
             ];
-            if let Err(error) = self
-                .telegram
-                .set_my_commands(&commands, language_code)
-                .await
-            {
-                warn!(
-                    ?language,
-                    error = %error,
-                    "设置 Telegram 命令菜单失败，继续运行"
-                );
+            let result = tokio::select! {
+                _ = shutdown.cancelled() => return,
+                result = tokio::time::timeout(
+                    COMMAND_CONFIGURATION_TIMEOUT,
+                    self.telegram.set_my_commands(&commands, language_code),
+                ) => result,
+            };
+            match result {
+                Ok(Ok(_)) => {}
+                Ok(Err(error)) => {
+                    warn!(
+                        ?language,
+                        error = %error,
+                        "设置 Telegram 命令菜单失败，继续运行"
+                    );
+                }
+                Err(_) => {
+                    warn!(?language, "设置 Telegram 命令菜单超时，继续运行");
+                }
             }
         }
     }
@@ -1229,9 +1235,8 @@ impl BotService {
 
             let kind = telegram_media_kind(probe.codec);
             let video_metadata = telegram_video_metadata(&probe);
-            // With a local Bot API `file://` input, TDLib performs the real
-            // Telegram upload internally and exposes no byte progress. Only
-            // the start of the request and its successful completion are real.
+            // TDLib performs the Telegram upload internally. Only the start of
+            // the request and its successful completion are exposed here.
             self.update_status_html(
                 task,
                 i18n::status(task.preferences.language, Status::Uploading),

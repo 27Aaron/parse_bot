@@ -19,7 +19,7 @@ jobs:
   rust:
     name: Rust checks
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
 
     steps:
       - name: Check out repository
@@ -30,6 +30,22 @@ jobs:
         with:
           toolchain: 1.88.0
           components: rustfmt, clippy
+
+      - name: Install TDLib linker dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes libc++-dev libc++abi-dev unzip
+
+      - name: Fetch hash-pinned TDLib 1.8.61
+        env:
+          TDLIB_SHA256: 997069633f54306ada33776d2c4a530017d2e7325a22e0f12701d52438c37383
+        run: |
+          curl --fail --location --silent --show-error \
+            --output "$RUNNER_TEMP/tdlib.zip" \
+            https://github.com/FedericoBruzzone/tdlib-rs/releases/download/v1.4.0/tdlib-1.8.61-linux-x86_64.zip
+          echo "$TDLIB_SHA256  $RUNNER_TEMP/tdlib.zip" | sha256sum --check
+          unzip -q "$RUNNER_TEMP/tdlib.zip" -d "$RUNNER_TEMP"
+          echo "LOCAL_TDLIB_PATH=$RUNNER_TEMP/tdlib" >> "$GITHUB_ENV"
 
       - name: Cache Cargo artifacts
         uses: Swatinem/rust-cache@v2

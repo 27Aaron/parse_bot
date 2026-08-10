@@ -5,17 +5,18 @@ use std::{
     time::Duration,
 };
 
-use url::{Host, Url};
-
 use crate::{AppError, Result, model::REVIEWED_WECHAT_MEDIA_HOSTS};
 
-const DEFAULT_TELEGRAM_API_URL: &str = "http://127.0.0.1:8081";
+const DEFAULT_TDLIB_DATA_DIR: &str = "./data/tdlib";
 const DEFAULT_MEDIA_MAX_BYTES: u64 = 2_000_000_000;
 const DEFAULT_TELEGRAM_HARD_LIMIT: u64 = 2_000_000_000;
 
 pub struct Config {
+    pub telegram_api_id: i32,
+    pub telegram_api_hash: String,
     pub telegram_bot_token: String,
-    pub telegram_api_url: Url,
+    pub tdlib_database_dir: PathBuf,
+    pub tdlib_files_dir: PathBuf,
     pub required_channel_id: Option<String>,
     pub wechat_yuanbao_cookie: String,
     pub wechat_resolve_timeout: Duration,
@@ -29,12 +30,14 @@ pub struct Config {
 
 impl Config {
     pub fn from_env() -> Result<Self> {
+        let telegram_api_id = parse_telegram_api_id(&required("TELEGRAM_API_ID")?)?;
+        let telegram_api_hash = parse_telegram_api_hash(required("TELEGRAM_API_HASH")?)?;
         let telegram_bot_token = required("TELEGRAM_BOT_TOKEN")?;
-        let telegram_api_url = env::var("TELEGRAM_BOT_API_URL")
-            .unwrap_or_else(|_| DEFAULT_TELEGRAM_API_URL.to_owned())
-            .parse::<Url>()
-            .map_err(|_| AppError::Config("TELEGRAM_BOT_API_URL 不是有效 URL".into()))?;
-        validate_local_bot_api_url(&telegram_api_url)?;
+        let tdlib_data_dir = env::var_os("TDLIB_DATA_DIR")
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(DEFAULT_TDLIB_DATA_DIR));
+        let (tdlib_database_dir, tdlib_files_dir) = tdlib_directories(&tdlib_data_dir);
 
         let required_channel_id = match env::var("REQUIRED_CHANNEL_ID") {
             Ok(value) => parse_required_channel_id(Some(&value))?,
@@ -88,8 +91,11 @@ impl Config {
             ));
         }
         Ok(Self {
+            telegram_api_id,
+            telegram_api_hash,
             telegram_bot_token,
-            telegram_api_url,
+            tdlib_database_dir,
+            tdlib_files_dir,
             required_channel_id,
             wechat_yuanbao_cookie,
             wechat_resolve_timeout: Duration::from_secs(wechat_resolve_timeout_secs),
@@ -103,11 +109,9 @@ impl Config {
     }
 
     pub fn prepare_paths(&mut self) -> Result<()> {
-        std::fs::create_dir_all(&self.media_shared_dir)?;
-        self.media_shared_dir = self
-            .media_shared_dir
-            .canonicalize()
-            .map_err(|_| AppError::Storage(self.media_shared_dir.clone()))?;
+        prepare_directory(&mut self.media_shared_dir)?;
+        prepare_directory(&mut self.tdlib_database_dir)?;
+        prepare_directory(&mut self.tdlib_files_dir)?;
 
         if let Some(parent) = self
             .database_path
@@ -118,6 +122,43 @@ impl Config {
         }
         Ok(())
     }
+}
+
+fn parse_telegram_api_id(value: &str) -> Result<i32> {
+    value
+        .trim()
+        .parse::<i32>()
+        .ok()
+        .filter(|value| *value > 0)
+        .ok_or_else(|| AppError::Config("TELEGRAM_API_ID 必须是大于 0 的整数".into()))
+}
+
+fn parse_telegram_api_hash(value: String) -> Result<String> {
+    let value = value.trim();
+    if value.len() != 32 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(AppError::Config(
+            "TELEGRAM_API_HASH 必须是 32 位十六进制字符串".into(),
+        ));
+    }
+    Ok(value.to_owned())
+}
+
+fn tdlib_directories(data_dir: &Path) -> (PathBuf, PathBuf) {
+    (data_dir.join("database"), data_dir.join("files"))
+}
+
+fn prepare_directory(path: &mut PathBuf) -> Result<()> {
+    std::fs::create_dir_all(&*path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        std::fs::set_permissions(&*path, std::fs::Permissions::from_mode(0o700))?;
+    }
+    *path = path
+        .canonicalize()
+        .map_err(|_| AppError::Storage(path.clone()))?;
+    Ok(())
 }
 
 fn required(name: &str) -> Result<String> {
@@ -178,33 +219,6 @@ fn parse_database_path(value: &str) -> Result<PathBuf> {
     Ok(Path::new(path).to_path_buf())
 }
 
-fn validate_local_bot_api_url(url: &Url) -> Result<()> {
-    if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
-        return Err(AppError::Config(
-            "TELEGRAM_BOT_API_URL 必须是 HTTP(S) URL".into(),
-        ));
-    }
-
-    let local = match url.host() {
-        Some(Host::Domain(host)) => host.eq_ignore_ascii_case("localhost"),
-        Some(Host::Ipv4(address)) => address.is_loopback(),
-        Some(Host::Ipv6(address)) => address.is_loopback(),
-        None => false,
-    };
-    if !local && url.scheme() != "https" {
-        return Err(AppError::Config(
-            "远程 TELEGRAM_BOT_API_URL 必须使用 HTTPS，避免泄露 Bot Token".into(),
-        ));
-    }
-    if !local && env::var("ALLOW_REMOTE_BOT_API").as_deref() != Ok("true") {
-        return Err(AppError::Config(
-            "本地 Bot API 默认只能使用 loopback；远程地址需显式设置 ALLOW_REMOTE_BOT_API=true"
-                .into(),
-        ));
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -223,15 +237,63 @@ mod tests {
     }
 
     #[test]
-    fn accepts_loopback_bot_api() {
-        let url = Url::parse("http://127.0.0.1:8081").unwrap();
-        assert!(validate_local_bot_api_url(&url).is_ok());
+    fn parses_positive_telegram_api_id() {
+        assert_eq!(parse_telegram_api_id(" 123456 ").unwrap(), 123_456);
     }
 
     #[test]
-    fn rejects_plain_http_for_remote_bot_api() {
-        let url = Url::parse("http://api.example.test:8081").unwrap();
-        assert!(validate_local_bot_api_url(&url).is_err());
+    fn rejects_invalid_telegram_api_id() {
+        for value in ["", "0", "-1", "not-a-number", "2147483648"] {
+            assert!(
+                parse_telegram_api_id(value).is_err(),
+                "unexpectedly accepted {value}"
+            );
+        }
+    }
+
+    #[test]
+    fn validates_telegram_api_hash() {
+        assert_eq!(
+            parse_telegram_api_hash(" 0123456789abcdef0123456789ABCDEF ".into()).unwrap(),
+            "0123456789abcdef0123456789ABCDEF"
+        );
+        for value in [
+            "0123456789abcdef",
+            "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+            "0123456789abcdef0123456789abcdef00",
+        ] {
+            assert!(parse_telegram_api_hash(value.into()).is_err());
+        }
+    }
+
+    #[test]
+    fn derives_separate_tdlib_directories() {
+        assert_eq!(
+            tdlib_directories(Path::new("./data/tdlib")),
+            (
+                PathBuf::from("./data/tdlib/database"),
+                PathBuf::from("./data/tdlib/files")
+            )
+        );
+    }
+
+    #[test]
+    fn prepares_and_canonicalizes_tdlib_directories() {
+        let root =
+            std::env::temp_dir().join(format!("parse-bot-config-test-{}", uuid::Uuid::new_v4()));
+        let data_dir = root.join("parent").join("..").join("tdlib");
+        let (mut database_dir, mut files_dir) = tdlib_directories(&data_dir);
+
+        prepare_directory(&mut database_dir).unwrap();
+        prepare_directory(&mut files_dir).unwrap();
+
+        assert_eq!(
+            database_dir,
+            root.join("tdlib/database").canonicalize().unwrap()
+        );
+        assert_eq!(files_dir, root.join("tdlib/files").canonicalize().unwrap());
+
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
