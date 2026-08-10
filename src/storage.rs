@@ -211,6 +211,36 @@ impl MediaCache {
         Ok(())
     }
 
+    pub async fn remove_if_file_id(
+        &self,
+        platform: &str,
+        post_id: &str,
+        file_id: &str,
+    ) -> Result<bool> {
+        let cache = self.clone();
+        let platform = platform.to_owned();
+        let post_id = post_id.to_owned();
+        let file_id = file_id.to_owned();
+        tokio::task::spawn_blocking(move || {
+            cache.remove_if_file_id_sync(&platform, &post_id, &file_id)
+        })
+        .await
+        .map_err(|_| AppError::Database("SQLite 条件删除任务异常退出".into()))?
+    }
+
+    fn remove_if_file_id_sync(&self, platform: &str, post_id: &str, file_id: &str) -> Result<bool> {
+        let deleted = self
+            .connection
+            .lock()
+            .execute(
+                "DELETE FROM telegram_media_cache
+                 WHERE platform = ?1 AND post_id = ?2 AND variant = ?3 AND file_id = ?4",
+                params![platform, post_id, VIDEO_VARIANT, file_id],
+            )
+            .map_err(db_error)?;
+        Ok(deleted > 0)
+    }
+
     pub async fn get_user_settings_with_default(
         &self,
         user_id: u64,
@@ -514,6 +544,48 @@ mod tests {
             )
             .unwrap();
         assert_eq!(compatible_count, 1);
+    }
+
+    #[tokio::test]
+    async fn stale_file_id_cannot_delete_a_newer_cache_entry() {
+        let connection = Connection::open_in_memory().unwrap();
+        initialize_connection(&connection).unwrap();
+        let cache = MediaCache {
+            connection: Arc::new(Mutex::new(connection)),
+        };
+        cache
+            .put(
+                "wechat_channels",
+                "abc",
+                TelegramMediaKind::Video,
+                "new-file-id",
+                Some("new-unique-id"),
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            !cache
+                .remove_if_file_id("wechat_channels", "abc", "stale-file-id")
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            cache
+                .get("wechat_channels", "abc")
+                .await
+                .unwrap()
+                .unwrap()
+                .file_id,
+            "new-file-id"
+        );
+        assert!(
+            cache
+                .remove_if_file_id("wechat_channels", "abc", "new-file-id")
+                .await
+                .unwrap()
+        );
+        assert!(cache.get("wechat_channels", "abc").await.unwrap().is_none());
     }
 
     #[test]
