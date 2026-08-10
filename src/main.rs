@@ -40,7 +40,7 @@ async fn main() -> Result<()> {
         resolver,
         downloader,
         cache,
-        config.allowed_user_ids,
+        config.required_channel_id,
         config.telegram_hard_limit_bytes,
         config.callback_ttl,
     );

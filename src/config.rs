@@ -16,7 +16,7 @@ const DEFAULT_TELEGRAM_HARD_LIMIT: u64 = 2_000_000_000;
 pub struct Config {
     pub telegram_bot_token: String,
     pub telegram_api_url: Url,
-    pub allowed_user_ids: HashSet<u64>,
+    pub required_channel_id: Option<String>,
     pub wechat_yuanbao_cookie: String,
     pub wechat_resolve_timeout: Duration,
     pub wechat_download_timeout: Duration,
@@ -37,12 +37,20 @@ impl Config {
             .map_err(|_| AppError::Config("TELEGRAM_BOT_API_URL 不是有效 URL".into()))?;
         validate_local_bot_api_url(&telegram_api_url)?;
 
-        let allowed_user_ids = parse_id_set(&required("ALLOWED_USER_IDS")?)?;
-        if allowed_user_ids.is_empty() {
+        if env::var_os("ALLOWED_USER_IDS").is_some() {
             return Err(AppError::Config(
-                "ALLOWED_USER_IDS 不能为空；本项目默认拒绝所有人".into(),
+                "ALLOWED_USER_IDS 已移除；请删除它，并按需配置 REQUIRED_CHANNEL_ID".into(),
             ));
         }
+        let required_channel_id = match env::var("REQUIRED_CHANNEL_ID") {
+            Ok(value) => parse_required_channel_id(Some(&value))?,
+            Err(env::VarError::NotPresent) => None,
+            Err(env::VarError::NotUnicode(_)) => {
+                return Err(AppError::Config(
+                    "REQUIRED_CHANNEL_ID 必须是有效的 UTF-8 文本".into(),
+                ));
+            }
+        };
 
         let wechat_yuanbao_cookie = required("WECHAT_YUANBAO_COOKIE")?;
         let media_shared_dir = env::var_os("MEDIA_SHARED_DIR")
@@ -93,7 +101,7 @@ impl Config {
         Ok(Self {
             telegram_bot_token,
             telegram_api_url,
-            allowed_user_ids,
+            required_channel_id,
             wechat_yuanbao_cookie,
             wechat_resolve_timeout: Duration::from_secs(wechat_resolve_timeout_secs),
             wechat_download_timeout: Duration::from_secs(wechat_download_timeout_secs),
@@ -122,10 +130,6 @@ impl Config {
         }
         Ok(())
     }
-
-    pub fn is_user_allowed(&self, user_id: u64) -> bool {
-        self.allowed_user_ids.contains(&user_id)
-    }
 }
 
 fn required(name: &str) -> Result<String> {
@@ -135,17 +139,28 @@ fn required(name: &str) -> Result<String> {
         .ok_or_else(|| AppError::Config(format!("缺少环境变量 {name}")))
 }
 
-fn parse_id_set(value: &str) -> Result<HashSet<u64>> {
-    value
-        .split(',')
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(|value| {
-            value
-                .parse::<u64>()
-                .map_err(|_| AppError::Config("ALLOWED_USER_IDS 必须是逗号分隔的数字".into()))
-        })
-        .collect()
+fn parse_required_channel_id(value: Option<&str>) -> Result<Option<String>> {
+    const MIN_USERNAME_LEN: usize = 5;
+    const MAX_USERNAME_LEN: usize = 32;
+
+    let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    let Some(username) = value.strip_prefix('@') else {
+        return Err(AppError::Config(
+            "REQUIRED_CHANNEL_ID 必须是以 @ 开头的公开频道用户名".into(),
+        ));
+    };
+    if !(MIN_USERNAME_LEN..=MAX_USERNAME_LEN).contains(&username.len())
+        || !username
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+    {
+        return Err(AppError::Config(
+            "REQUIRED_CHANNEL_ID 的 @ 后必须是 5-32 个 ASCII 字母、数字或下划线".into(),
+        ));
+    }
+    Ok(Some(value.to_owned()))
 }
 
 fn parse_u64(name: &str, default: u64) -> Result<u64> {
@@ -229,5 +244,36 @@ mod tests {
     fn rejects_plain_http_for_remote_bot_api() {
         let url = Url::parse("http://api.example.test:8081").unwrap();
         assert!(validate_local_bot_api_url(&url).is_err());
+    }
+
+    #[test]
+    fn missing_or_empty_required_channel_is_disabled() {
+        assert_eq!(parse_required_channel_id(None).unwrap(), None);
+        assert_eq!(parse_required_channel_id(Some("")).unwrap(), None);
+        assert_eq!(parse_required_channel_id(Some("   ")).unwrap(), None);
+    }
+
+    #[test]
+    fn accepts_public_channel_username() {
+        assert_eq!(
+            parse_required_channel_id(Some(" @Aaron_Channels ")).unwrap(),
+            Some("@Aaron_Channels".into())
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_public_channel_username() {
+        for value in [
+            "Aaron_Channels",
+            "@abcd",
+            "@abcdefghijklmnopqrstuvwxyz1234567",
+            "@Aaron-Channels",
+            "@频道Aaron",
+        ] {
+            assert!(
+                parse_required_channel_id(Some(value)).is_err(),
+                "unexpectedly accepted {value}"
+            );
+        }
     }
 }

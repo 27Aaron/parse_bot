@@ -29,7 +29,7 @@ pub struct BotService {
     resolver: WechatResolver,
     downloader: MediaDownloader,
     cache: MediaCache,
-    allowed_user_ids: Arc<HashSet<u64>>,
+    required_channel_id: Option<Arc<str>>,
     telegram_hard_limit: u64,
     callback_ttl: Duration,
     pending: Arc<RwLock<HashMap<String, PendingDownload>>>,
@@ -61,7 +61,7 @@ impl BotService {
         resolver: WechatResolver,
         downloader: MediaDownloader,
         cache: MediaCache,
-        allowed_user_ids: HashSet<u64>,
+        required_channel_id: Option<String>,
         telegram_hard_limit: u64,
         callback_ttl: Duration,
     ) -> Self {
@@ -70,7 +70,7 @@ impl BotService {
             resolver,
             downloader,
             cache,
-            allowed_user_ids: Arc::new(allowed_user_ids),
+            required_channel_id: required_channel_id.map(Arc::from),
             telegram_hard_limit,
             callback_ttl,
             pending: Arc::new(RwLock::new(HashMap::new())),
@@ -120,13 +120,6 @@ impl BotService {
             return Ok(());
         };
         let chat_id = message.chat.id;
-        if !self.is_allowed(user_id) {
-            let _ = self
-                .telegram
-                .send_message(chat_id, "这个机器人是私人使用的。", None)
-                .await;
-            return Ok(());
-        }
         if !message.chat.is_private() {
             let _ = self
                 .telegram
@@ -144,13 +137,8 @@ impl BotService {
 
         match command {
             Some("start" | "help") => {
-                self.telegram
-                    .send_message(
-                        chat_id,
-                        "发送微信视频号链接或分享文案，我会自动下载并发送原画视频。\n\n新文件最大支持 2000 MB；大文件需要自建 telegram-bot-api --local。",
-                        None,
-                    )
-                    .await?;
+                let help = format_help_text(self.required_channel_id.as_deref());
+                self.telegram.send_message(chat_id, &help, None).await?;
             }
             Some("parse") => {
                 let inline = text.split_once(char::is_whitespace).map(|(_, value)| value);
@@ -212,6 +200,13 @@ impl BotService {
         source_message_id: i64,
         input: &str,
     ) -> Result<()> {
+        if !self
+            .ensure_required_channel(chat_id, user_id, source_message_id)
+            .await?
+        {
+            return Ok(());
+        }
+
         if self.active_tasks.lock().await.contains_key(&user_id) {
             self.telegram
                 .send_message_reply(
@@ -331,14 +326,6 @@ impl BotService {
     }
 
     async fn handle_callback(&self, callback: CallbackQuery) -> Result<()> {
-        let user_id = callback.sender.id;
-        if !self.is_allowed(user_id) {
-            let _ = self
-                .telegram
-                .answer_callback_query(&callback.id, Some("没有权限"), true)
-                .await;
-            return Ok(());
-        }
         let data = callback.data.as_deref().ok_or(AppError::Expired)?;
 
         if let Some(nonce) = data.strip_prefix("cancel:") {
@@ -676,8 +663,43 @@ impl BotService {
         }
     }
 
-    fn is_allowed(&self, user_id: u64) -> bool {
-        self.allowed_user_ids.contains(&user_id)
+    async fn ensure_required_channel(
+        &self,
+        chat_id: i64,
+        user_id: u64,
+        source_message_id: i64,
+    ) -> Result<bool> {
+        let Some(channel_id) = self.required_channel_id.as_deref() else {
+            return Ok(true);
+        };
+
+        match self.telegram.get_chat_member(channel_id, user_id).await {
+            Ok(member) if member.has_joined() => Ok(true),
+            Ok(_) => {
+                let prompt = format_channel_requirement(channel_id);
+                self.telegram
+                    .send_message_reply_html(chat_id, &prompt, source_message_id, None)
+                    .await?;
+                Ok(false)
+            }
+            Err(error) => {
+                warn!(
+                    error = %error,
+                    channel_id,
+                    user_id,
+                    "频道成员状态验证失败"
+                );
+                self.telegram
+                    .send_message_reply(
+                        chat_id,
+                        "暂时无法验证频道关注状态，请稍后重试。",
+                        source_message_id,
+                        None,
+                    )
+                    .await?;
+                Ok(false)
+            }
+        }
     }
 }
 
@@ -705,6 +727,27 @@ fn format_caption_parts(title: &str, source: &str) -> String {
     let title = escape_html(title);
     let source = escape_html(source);
     format!("{title}\n\n<b>▎<a href=\"{source}\">Source</a></b>")
+}
+
+fn format_help_text(required_channel_id: Option<&str>) -> String {
+    let mut text = String::from(
+        "发送微信视频号链接或分享文案，我会自动下载并发送原画视频。\n\n新文件最大支持 2000 MB；大文件需要自建 telegram-bot-api --local。",
+    );
+    if let Some(channel_id) = required_channel_id {
+        text.push_str("\n\n使用前需要关注频道 ");
+        text.push_str(channel_id);
+        text.push('。');
+    }
+    text
+}
+
+fn format_channel_requirement(channel_id: &str) -> String {
+    let username = channel_id.trim_start_matches('@');
+    let label = escape_html(channel_id);
+    let url = escape_html(&format!("https://t.me/{username}"));
+    format!(
+        "使用此机器人前，请先关注频道。\n\n<b>▎<a href=\"{url}\">{label}</a></b>\n\n关注后重新发送链接即可。"
+    )
 }
 
 fn format_download_status(percent: u8) -> String {
@@ -764,5 +807,22 @@ mod tests {
         assert_eq!(format_download_status(60), "<b>▎下 载 中... | 60%</b>");
         assert_eq!(format_download_status(80), "<b>▎下 载 中... | 80%</b>");
         assert_eq!(format_download_status(100), "<b>▎下 载 中... | 100%</b>");
+    }
+
+    #[test]
+    fn mentions_the_required_channel_only_when_configured() {
+        let public_help = format_help_text(None);
+        assert!(!public_help.contains("关注频道"));
+
+        let gated_help = format_help_text(Some("@Aaron_Channels"));
+        assert!(gated_help.contains("使用前需要关注频道 @Aaron_Channels。"));
+    }
+
+    #[test]
+    fn formats_a_clickable_channel_requirement() {
+        assert_eq!(
+            format_channel_requirement("@Aaron_Channels"),
+            "使用此机器人前，请先关注频道。\n\n<b>▎<a href=\"https://t.me/Aaron_Channels\">@Aaron_Channels</a></b>\n\n关注后重新发送链接即可。"
+        );
     }
 }

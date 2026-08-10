@@ -167,6 +167,15 @@ impl TelegramClient {
         self.call("getMe", &EmptyRequest {}, None).await
     }
 
+    pub async fn get_chat_member(&self, chat_id: &str, user_id: u64) -> TelegramResult<ChatMember> {
+        self.call(
+            "getChatMember",
+            &GetChatMemberRequest { chat_id, user_id },
+            None,
+        )
+        .await
+    }
+
     pub async fn get_updates(
         &self,
         offset: Option<i64>,
@@ -831,6 +840,38 @@ pub struct User {
     pub is_premium: Option<bool>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ChatMemberStatus {
+    Creator,
+    Administrator,
+    Member,
+    Restricted,
+    Left,
+    Kicked,
+    #[serde(other)]
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct ChatMember {
+    pub status: ChatMemberStatus,
+    #[serde(default)]
+    pub is_member: Option<bool>,
+}
+
+impl ChatMember {
+    pub fn has_joined(&self) -> bool {
+        match self.status {
+            ChatMemberStatus::Creator
+            | ChatMemberStatus::Administrator
+            | ChatMemberStatus::Member => true,
+            ChatMemberStatus::Restricted => self.is_member == Some(true),
+            ChatMemberStatus::Left | ChatMemberStatus::Kicked | ChatMemberStatus::Unknown => false,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ChatKind {
@@ -980,6 +1021,12 @@ struct ResponseParameters {
 struct EmptyRequest {}
 
 #[derive(Serialize)]
+struct GetChatMemberRequest<'a> {
+    chat_id: &'a str,
+    user_id: u64,
+}
+
+#[derive(Serialize)]
 struct GetUpdatesRequest<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     offset: Option<i64>,
@@ -1064,6 +1111,46 @@ struct SendDocumentRequest<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn classifies_chat_membership_statuses() {
+        for status in ["creator", "administrator", "member"] {
+            let member: ChatMember =
+                serde_json::from_value(serde_json::json!({ "status": status })).unwrap();
+            assert!(member.has_joined(), "{status}");
+            assert_eq!(member.is_member, None);
+        }
+
+        let restricted_member: ChatMember = serde_json::from_value(serde_json::json!({
+            "status": "restricted",
+            "is_member": true
+        }))
+        .unwrap();
+        assert!(restricted_member.has_joined());
+
+        for value in [
+            serde_json::json!({ "status": "restricted", "is_member": false }),
+            serde_json::json!({ "status": "restricted" }),
+            serde_json::json!({ "status": "left" }),
+            serde_json::json!({ "status": "kicked" }),
+            serde_json::json!({ "status": "future_status", "is_member": true }),
+        ] {
+            let member: ChatMember = serde_json::from_value(value).unwrap();
+            assert!(!member.has_joined(), "{member:?}");
+        }
+    }
+
+    #[test]
+    fn serializes_get_chat_member_request() {
+        let request = GetChatMemberRequest {
+            chat_id: "@required_channel",
+            user_id: 42,
+        };
+        let value = serde_json::to_value(request).unwrap();
+
+        assert_eq!(value["chat_id"], "@required_channel");
+        assert_eq!(value["user_id"], 42);
+    }
 
     #[test]
     fn deserializes_private_text_reply_and_callback_update() {
