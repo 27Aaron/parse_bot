@@ -1,13 +1,15 @@
 use std::{path::Path, str::FromStr, sync::Arc};
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, TimeDelta, Utc};
 use parking_lot::Mutex;
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 
 use crate::{AppError, Result, model::TelegramMediaKind};
 
-const CACHE_SCHEMA_VERSION: i64 = 4;
-const ORIGINAL_VARIANT: &str = "original";
+const CACHE_SCHEMA_VERSION: i64 = 5;
+const VIDEO_VARIANT: &str = "video";
+const CACHE_MAX_ENTRIES: usize = 10_000;
+const CACHE_MAX_AGE_DAYS: i64 = 180;
 
 #[derive(Clone)]
 pub struct MediaCache {
@@ -43,12 +45,14 @@ impl MediaCache {
 
     fn get_sync(&self, platform: &str, post_id: &str) -> Result<Option<CachedTelegramMedia>> {
         let connection = self.connection.lock();
+        let cutoff = cache_cutoff(CACHE_MAX_AGE_DAYS)?;
         let row = connection
             .query_row(
                 "SELECT file_id, file_unique_id, media_kind, created_at
                  FROM telegram_media_cache
-                 WHERE platform = ?1 AND post_id = ?2 AND variant = ?3",
-                params![platform, post_id, ORIGINAL_VARIANT],
+                 WHERE platform = ?1 AND post_id = ?2 AND variant = ?3
+                   AND julianday(last_used_at) >= julianday(?4)",
+                params![platform, post_id, VIDEO_VARIANT, cutoff],
                 |row| {
                     let kind = TelegramMediaKind::from_str(row.get::<_, String>(2)?.as_str())
                         .map_err(|_| {
@@ -84,7 +88,19 @@ impl MediaCache {
                 .execute(
                     "UPDATE telegram_media_cache SET last_used_at = ?4
                      WHERE platform = ?1 AND post_id = ?2 AND variant = ?3",
-                    params![platform, post_id, ORIGINAL_VARIANT, Utc::now().to_rfc3339()],
+                    params![platform, post_id, VIDEO_VARIANT, Utc::now().to_rfc3339()],
+                )
+                .map_err(db_error)?;
+        } else {
+            // Remove an expired or malformed matching row so a later read
+            // cannot revive it by refreshing `last_used_at`.
+            connection
+                .execute(
+                    "DELETE FROM telegram_media_cache
+                     WHERE platform = ?1 AND post_id = ?2 AND variant = ?3
+                       AND (julianday(last_used_at) IS NULL
+                            OR julianday(last_used_at) < julianday(?4))",
+                    params![platform, post_id, VIDEO_VARIANT, cutoff],
                 )
                 .map_err(db_error)?;
         }
@@ -126,8 +142,8 @@ impl MediaCache {
         file_unique_id: Option<&str>,
     ) -> Result<()> {
         let now = Utc::now().to_rfc3339();
-        self.connection
-            .lock()
+        let connection = self.connection.lock();
+        connection
             .execute(
                 "INSERT INTO telegram_media_cache (
                      platform, post_id, variant, media_kind,
@@ -141,7 +157,7 @@ impl MediaCache {
                 params![
                     platform,
                     post_id,
-                    ORIGINAL_VARIANT,
+                    VIDEO_VARIANT,
                     kind.as_str(),
                     file_id,
                     file_unique_id,
@@ -149,6 +165,7 @@ impl MediaCache {
                 ],
             )
             .map_err(db_error)?;
+        prune_cache(&connection, CACHE_MAX_ENTRIES, CACHE_MAX_AGE_DAYS)?;
         Ok(())
     }
 
@@ -167,7 +184,7 @@ impl MediaCache {
             .execute(
                 "DELETE FROM telegram_media_cache
                  WHERE platform = ?1 AND post_id = ?2 AND variant = ?3",
-                params![platform, post_id, ORIGINAL_VARIANT],
+                params![platform, post_id, VIDEO_VARIANT],
             )
             .map_err(db_error)?;
         Ok(())
@@ -190,39 +207,109 @@ fn initialize_connection(connection: &Connection) -> Result<()> {
                  created_at TEXT NOT NULL,
                  last_used_at TEXT NOT NULL,
                  PRIMARY KEY (platform, post_id, variant)
-             );",
+             );
+             CREATE INDEX IF NOT EXISTS telegram_media_cache_last_used_idx
+                 ON telegram_media_cache(last_used_at);",
         )
         .map_err(db_error)?;
 
-    let schema_version = connection
+    let transaction =
+        Transaction::new_unchecked(connection, TransactionBehavior::Immediate).map_err(db_error)?;
+    let schema_version = transaction
         .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
         .map_err(db_error)?;
+    if schema_version > CACHE_SCHEMA_VERSION {
+        return Err(AppError::Database(format!(
+            "数据库版本 {schema_version} 高于程序支持的版本 {CACHE_SCHEMA_VERSION}"
+        )));
+    }
     if schema_version < 3 {
-        // Versions before 3 sent originals without reliable preview metadata.
-        // Invalidate them once so Telegram can rebuild the preview.
-        connection
+        // Versions before 3 did not store reliable preview metadata. Invalidate
+        // the former single-quality cache once so Telegram can rebuild it.
+        transaction
             .execute(
                 "DELETE FROM telegram_media_cache
-                 WHERE variant = ?1",
-                params![ORIGINAL_VARIANT],
+                 WHERE variant = 'original'",
+                [],
+            )
+            .map_err(db_error)?;
+    }
+    if schema_version < 4 {
+        // Version 4 removed the former low-quality cache.
+        transaction
+            .execute(
+                "DELETE FROM telegram_media_cache
+                 WHERE variant <> 'original'",
+                [],
             )
             .map_err(db_error)?;
     }
     if schema_version < CACHE_SCHEMA_VERSION {
-        // Version 4 only caches the original-quality result. This also removes
-        // compatible/low-quality rows on a direct upgrade from any old version.
-        connection
+        // Version 5 renames the remaining single-video cache key. Drop any
+        // pre-release rows already using the new key before moving the trusted
+        // version-4 rows, so the migration cannot hit a primary-key conflict.
+        transaction
             .execute(
-                "DELETE FROM telegram_media_cache
-                 WHERE variant <> ?1",
-                params![ORIGINAL_VARIANT],
+                "DELETE FROM telegram_media_cache WHERE variant = ?1",
+                params![VIDEO_VARIANT],
             )
             .map_err(db_error)?;
-        connection
+        transaction
+            .execute(
+                "UPDATE telegram_media_cache
+                 SET variant = ?1
+                 WHERE variant = 'original'",
+                params![VIDEO_VARIANT],
+            )
+            .map_err(db_error)?;
+        transaction
+            .execute(
+                "DELETE FROM telegram_media_cache WHERE variant <> ?1",
+                params![VIDEO_VARIANT],
+            )
+            .map_err(db_error)?;
+        transaction
             .pragma_update(None, "user_version", CACHE_SCHEMA_VERSION)
             .map_err(db_error)?;
     }
+    prune_cache(&transaction, CACHE_MAX_ENTRIES, CACHE_MAX_AGE_DAYS)?;
+    transaction.commit().map_err(db_error)?;
     Ok(())
+}
+
+fn prune_cache(connection: &Connection, max_entries: usize, max_age_days: i64) -> Result<()> {
+    let cutoff = cache_cutoff(max_age_days)?;
+    connection
+        .execute(
+            "DELETE FROM telegram_media_cache
+             WHERE julianday(last_used_at) IS NULL
+                OR julianday(last_used_at) < julianday(?1)",
+            params![cutoff],
+        )
+        .map_err(db_error)?;
+
+    let offset = i64::try_from(max_entries)
+        .map_err(|_| AppError::Database("缓存条目上限超出支持范围".into()))?;
+    connection
+        .execute(
+            "DELETE FROM telegram_media_cache
+             WHERE rowid IN (
+                 SELECT rowid
+                 FROM telegram_media_cache
+                 ORDER BY last_used_at DESC, rowid DESC
+                 LIMIT -1 OFFSET ?1
+             )",
+            params![offset],
+        )
+        .map_err(db_error)?;
+    Ok(())
+}
+
+fn cache_cutoff(max_age_days: i64) -> Result<String> {
+    Utc::now()
+        .checked_sub_signed(TimeDelta::days(max_age_days))
+        .map(|value| value.to_rfc3339())
+        .ok_or_else(|| AppError::Database("缓存保留期限超出支持范围".into()))
 }
 
 fn db_error(error: rusqlite::Error) -> AppError {
@@ -234,7 +321,7 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn cache_operations_only_target_original_variant() {
+    async fn cache_operations_only_target_current_video_variant() {
         let connection = Connection::open_in_memory().unwrap();
         initialize_connection(&connection).unwrap();
         insert_cache_row(&connection, "abc", "compatible", "low-file-id");
@@ -246,14 +333,14 @@ mod tests {
                 "wechat_channels",
                 "abc",
                 TelegramMediaKind::Document,
-                "original-file-id",
+                "video-file-id",
                 Some("unique-id"),
             )
             .await
             .unwrap();
 
         let cached = cache.get("wechat_channels", "abc").await.unwrap().unwrap();
-        assert_eq!(cached.file_id, "original-file-id");
+        assert_eq!(cached.file_id, "video-file-id");
         assert_eq!(cached.kind, TelegramMediaKind::Document);
 
         cache.remove("wechat_channels", "abc").await.unwrap();
@@ -276,7 +363,7 @@ mod tests {
         let connection = Connection::open_in_memory().unwrap();
         initialize_connection(&connection).unwrap();
         connection.pragma_update(None, "user_version", 2).unwrap();
-        insert_cache_row(&connection, "old-original", "original", "original-id");
+        insert_cache_row(&connection, "old-single", "original", "single-id");
         insert_cache_row(&connection, "old-compatible", "compatible", "low-id");
 
         initialize_connection(&connection).unwrap();
@@ -285,32 +372,162 @@ mod tests {
     }
 
     #[test]
-    fn upgrade_from_v3_preserves_original_and_removes_low_quality_cache() {
+    fn upgrade_from_v3_preserves_single_video_and_removes_low_quality_cache() {
         let connection = Connection::open_in_memory().unwrap();
         initialize_connection(&connection).unwrap();
         connection.pragma_update(None, "user_version", 3).unwrap();
-        insert_cache_row(&connection, "valid-original", "original", "original-id");
+        insert_cache_row(&connection, "valid-single", "original", "single-id");
         insert_cache_row(&connection, "old-compatible", "compatible", "low-id");
 
         initialize_connection(&connection).unwrap();
-        assert_eq!(cached_post_ids(&connection), vec!["valid-original"]);
+        assert_eq!(cached_post_ids(&connection), vec!["valid-single"]);
+        assert_eq!(cached_variant(&connection, "valid-single"), "video");
         assert_eq!(schema_version(&connection), CACHE_SCHEMA_VERSION);
 
         initialize_connection(&connection).unwrap();
-        assert_eq!(cached_post_ids(&connection), vec!["valid-original"]);
+        assert_eq!(cached_post_ids(&connection), vec!["valid-single"]);
+    }
+
+    #[test]
+    fn upgrade_from_v4_preserves_cached_media_fields_atomically() {
+        let connection = Connection::open_in_memory().unwrap();
+        initialize_connection(&connection).unwrap();
+        connection.pragma_update(None, "user_version", 4).unwrap();
+        let now = Utc::now().to_rfc3339();
+        connection
+            .execute(
+                "INSERT INTO telegram_media_cache (
+                     platform, post_id, variant, media_kind, file_id,
+                     file_unique_id, created_at, last_used_at
+                 ) VALUES ('wechat_channels', 'migrated', 'original', 'video',
+                           'file-id', 'unique-id', ?1, ?1)",
+                params![now],
+            )
+            .unwrap();
+
+        initialize_connection(&connection).unwrap();
+        let migrated: (String, String, String, Option<String>, String, String) = connection
+            .query_row(
+                "SELECT variant, media_kind, file_id, file_unique_id,
+                        created_at, last_used_at
+                 FROM telegram_media_cache WHERE post_id = 'migrated'",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            migrated,
+            (
+                "video".into(),
+                "video".into(),
+                "file-id".into(),
+                Some("unique-id".into()),
+                now.clone(),
+                now,
+            )
+        );
+    }
+
+    #[test]
+    fn rejects_a_database_created_by_a_newer_program() {
+        let connection = Connection::open_in_memory().unwrap();
+        initialize_connection(&connection).unwrap();
+        connection
+            .pragma_update(None, "user_version", CACHE_SCHEMA_VERSION + 1)
+            .unwrap();
+
+        assert!(matches!(
+            initialize_connection(&connection),
+            Err(AppError::Database(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn an_expired_entry_cannot_be_revived_by_a_read() {
+        let connection = Connection::open_in_memory().unwrap();
+        initialize_connection(&connection).unwrap();
+        insert_cache_row_at(
+            &connection,
+            "expired",
+            VIDEO_VARIANT,
+            "expired-id",
+            "2020-01-01T00:00:00Z",
+        );
+        let cache = MediaCache {
+            connection: Arc::new(Mutex::new(connection)),
+        };
+
+        assert!(
+            cache
+                .get("wechat_channels", "expired")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(cached_post_ids(&cache.connection.lock()).is_empty());
+    }
+
+    #[test]
+    fn pruning_removes_expired_and_least_recently_used_rows() {
+        let connection = Connection::open_in_memory().unwrap();
+        initialize_connection(&connection).unwrap();
+        let older = (Utc::now() - TimeDelta::days(2)).to_rfc3339();
+        let newer = (Utc::now() - TimeDelta::days(1)).to_rfc3339();
+        insert_cache_row_at(
+            &connection,
+            "expired",
+            VIDEO_VARIANT,
+            "expired-id",
+            "2020-01-01T00:00:00Z",
+        );
+        insert_cache_row_at(&connection, "older", VIDEO_VARIANT, "older-id", &older);
+        insert_cache_row_at(&connection, "newer", VIDEO_VARIANT, "newer-id", &newer);
+
+        prune_cache(&connection, 1, CACHE_MAX_AGE_DAYS).unwrap();
+        assert_eq!(cached_post_ids(&connection), vec!["newer"]);
     }
 
     fn insert_cache_row(connection: &Connection, post_id: &str, variant: &str, file_id: &str) {
+        let now = Utc::now().to_rfc3339();
+        insert_cache_row_at(connection, post_id, variant, file_id, &now);
+    }
+
+    fn insert_cache_row_at(
+        connection: &Connection,
+        post_id: &str,
+        variant: &str,
+        file_id: &str,
+        last_used_at: &str,
+    ) {
         connection
             .execute(
                 "INSERT INTO telegram_media_cache (
                      platform, post_id, variant, media_kind, file_id,
                      file_unique_id, created_at, last_used_at
                  ) VALUES ('wechat_channels', ?1, ?2, 'document', ?3, NULL,
-                           '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
-                params![post_id, variant, file_id],
+                           ?4, ?4)",
+                params![post_id, variant, file_id, last_used_at],
             )
             .unwrap();
+    }
+
+    fn cached_variant(connection: &Connection, post_id: &str) -> String {
+        connection
+            .query_row(
+                "SELECT variant FROM telegram_media_cache WHERE post_id = ?1",
+                params![post_id],
+                |row| row.get(0),
+            )
+            .unwrap()
     }
 
     fn cached_post_ids(connection: &Connection) -> Vec<String> {
