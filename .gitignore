@@ -1,0 +1,36 @@
+# Local planning notes
+/TODO/
+
+# Rust build artifacts
+target/
+**/*.rs.bk
+rustc-ice-*.txt
+
+# Compiled binaries and native build artifacts
+*.o
+*.obj
+*.a
+*.lib
+*.so
+*.so.*
+*.dylib
+*.dll
+*.exe
+*.out
+*.pdb
+*.dSYM/
+*.profraw
+*.profdata
+
+# macOS metadata and filesystem artifacts
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+.Spotlight-V100
+.TemporaryItems
+.Trashes
+.fseventsd
+.VolumeIcon.icns
+.com.apple.timemachine.donotpresent
+.apdisk
