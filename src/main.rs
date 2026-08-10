@@ -18,6 +18,15 @@ async fn main() -> Result<()> {
     init_tracing();
 
     let config = Config::from_env()?;
+    let _data_directory_lock = config.data_paths.acquire_lock()?;
+    let cleanup = config.data_paths.cleanup_stale_media()?;
+    if cleanup.files > 0 {
+        warn!(
+            files = cleanup.files,
+            bytes = cleanup.bytes,
+            "已清理上次异常退出遗留的临时媒体"
+        );
+    }
 
     let resolver = WechatResolver::new(config.wechat_yuanbao_cookie.clone())?;
     let downloader =
@@ -94,7 +103,10 @@ async fn shutdown_signal() -> std::io::Result<()> {
 
 fn load_local_environment() -> Result<()> {
     for path in [".env.local", ".env"] {
-        match dotenvy::from_path(path) {
+        let Some(file) = open_local_environment_file(std::path::Path::new(path))? else {
+            continue;
+        };
+        match dotenvy::from_read(file) {
             // `.env.local` is the preferred complete local configuration;
             // `.env` is only a fallback when it does not exist.
             Ok(()) => return Ok(()),
@@ -118,6 +130,50 @@ fn load_local_environment() -> Result<()> {
     Ok(())
 }
 
+fn open_local_environment_file(path: &std::path::Path) -> Result<Option<std::fs::File>> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    let file = match options.open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(AppError::Io(error)),
+    };
+    let metadata = file.metadata()?;
+    if !metadata.file_type().is_file() {
+        return Err(AppError::Config(format!(
+            "{} 必须是普通文件",
+            path.display()
+        )));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        // SAFETY: geteuid takes no pointers and has no preconditions.
+        let effective_user_id = unsafe { libc::geteuid() };
+        if metadata.uid() != effective_user_id {
+            return Err(AppError::Config(format!(
+                "{} 必须归当前运行用户所有",
+                path.display()
+            )));
+        }
+        if metadata.permissions().mode() & 0o077 != 0 {
+            return Err(AppError::Config(format!(
+                "{} 权限过宽，请执行 chmod 600 {}",
+                path.display(),
+                path.display()
+            )));
+        }
+    }
+    Ok(Some(file))
+}
+
 fn init_tracing() {
     let filter =
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("parse_bot=info,warn"));
@@ -126,4 +182,39 @@ fn init_tracing() {
         .with_target(false)
         .compact()
         .init();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn local_environment_file_must_be_private_and_not_a_symlink() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let directory = std::env::temp_dir().join(format!(
+            "parse-bot-env-test-{}",
+            uuid::Uuid::new_v4().hyphenated()
+        ));
+        std::fs::create_dir(&directory).unwrap();
+        let environment = directory.join(".env.local");
+        std::fs::write(&environment, b"EXAMPLE=value\n").unwrap();
+        std::fs::set_permissions(&environment, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(open_local_environment_file(&environment).unwrap().is_some());
+
+        std::fs::set_permissions(&environment, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(open_local_environment_file(&environment).is_err());
+        std::fs::set_permissions(&environment, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        let link = directory.join("linked.env");
+        symlink(&environment, &link).unwrap();
+        assert!(open_local_environment_file(&link).is_err());
+        assert!(
+            open_local_environment_file(&directory.join("missing"))
+                .unwrap()
+                .is_none()
+        );
+        std::fs::remove_dir_all(directory).unwrap();
+    }
 }

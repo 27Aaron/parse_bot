@@ -8,9 +8,10 @@ publish = false
 
 [dependencies]
 base64 = "0.22"
-chrono = { version = "0.4", features = ["serde"] }
+chrono = "0.4"
 dotenvy = "0.15"
 futures-util = "0.3"
+libc = "0.2"
 parking_lot = "0.12"
 regex = "1"
 reqwest = { version = "0.13", default-features = false, features = ["json", "stream", "rustls"] }
@@ -23,7 +24,7 @@ tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "process"
 tokio-util = { version = "0.7", features = ["rt"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
-url = { version = "2", features = ["serde"] }
+url = "2"
 uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]

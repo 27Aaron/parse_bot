@@ -1083,6 +1083,7 @@ dependencies = [
  "dotenvy",
  "futures-util",
  "hex",
+ "libc",
  "parking_lot",
  "regex",
  "reqwest",
@@ -2105,7 +2106,6 @@ dependencies = [
  "idna",
  "percent-encoding",
  "serde",
- "serde_derive",
 ]
 
 [[package]]

@@ -1,12 +1,16 @@
 use std::{
     env,
     ffi::OsStr,
+    fs::{File, OpenOptions},
     path::{Path, PathBuf},
 };
 
 use crate::{AppError, Result};
 
 const DEFAULT_DATA_DIR: &str = "./data";
+const INSTANCE_LOCK_FILE: &str = ".parse-bot.lock";
+const UPLOAD_LEASE_PREFIX: &str = ".tdlib-upload-lease-";
+const MANAGED_MEDIA_EXTENSIONS: &[&str] = &["mp4", "jpg", "png", "webp"];
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DataPaths {
@@ -15,6 +19,18 @@ pub struct DataPaths {
     pub media: PathBuf,
     pub tdlib_database: PathBuf,
     pub tdlib_files: PathBuf,
+}
+
+/// Keeps the configured data directory exclusive to one running Bot process.
+/// The operating system releases the lock even after an unclean process exit.
+pub struct DataDirectoryLock {
+    _file: File,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct MediaCleanupSummary {
+    pub files: usize,
+    pub bytes: u64,
 }
 
 impl DataPaths {
@@ -43,6 +59,98 @@ impl DataPaths {
 
         Ok(paths)
     }
+
+    pub fn acquire_lock(&self) -> Result<DataDirectoryLock> {
+        let path = self.root.join(INSTANCE_LOCK_FILE);
+        let mut options = OpenOptions::new();
+        options.read(true).write(true).create(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+
+            options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+
+            // A second process cannot open the same lock file until this handle
+            // is dropped. The file itself intentionally persists across runs.
+            options.share_mode(0);
+        }
+
+        let file = options.open(&path).map_err(|error| {
+            #[cfg(windows)]
+            if error.kind() == std::io::ErrorKind::PermissionDenied {
+                return AppError::Config("DATA_DIR 已被另一个 Bot 进程占用".into());
+            }
+            AppError::Io(error)
+        })?;
+        if !file.metadata()?.is_file() {
+            return Err(AppError::Config("DATA_DIR 实例锁路径必须是普通文件".into()));
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        }
+
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd;
+
+            // SAFETY: `file` owns a valid descriptor for the duration of this
+            // call. LOCK_NB makes contention observable instead of blocking a
+            // second startup indefinitely.
+            let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+            if result != 0 {
+                let error = std::io::Error::last_os_error();
+                return if error.kind() == std::io::ErrorKind::WouldBlock {
+                    Err(AppError::Config("DATA_DIR 已被另一个 Bot 进程占用".into()))
+                } else {
+                    Err(AppError::Io(error))
+                };
+            }
+        }
+
+        Ok(DataDirectoryLock { _file: file })
+    }
+
+    /// Removes only files created by the media downloader or TDLib upload
+    /// leasing code. Call this after acquiring the process lock and before
+    /// accepting work, so an unclean shutdown cannot accumulate large files.
+    pub fn cleanup_stale_media(&self) -> Result<MediaCleanupSummary> {
+        let mut summary = MediaCleanupSummary::default();
+        for entry in std::fs::read_dir(&self.media)? {
+            let entry = entry?;
+            if !is_managed_media_file(&entry.file_name()) {
+                continue;
+            }
+            let metadata = std::fs::symlink_metadata(entry.path())?;
+            if !metadata.file_type().is_file() && !metadata.file_type().is_symlink() {
+                continue;
+            }
+            std::fs::remove_file(entry.path())?;
+            summary.files = summary.files.saturating_add(1);
+            summary.bytes = summary.bytes.saturating_add(metadata.len());
+        }
+        Ok(summary)
+    }
+}
+
+fn is_managed_media_file(file_name: &OsStr) -> bool {
+    let Some(file_name) = file_name.to_str() else {
+        return false;
+    };
+    let Some((stem, extension)) = file_name.rsplit_once('.') else {
+        return false;
+    };
+    if !MANAGED_MEDIA_EXTENSIONS.contains(&extension) {
+        return false;
+    }
+    let uuid = stem.strip_prefix(UPLOAD_LEASE_PREFIX).unwrap_or(stem);
+    uuid::Uuid::parse_str(uuid).is_ok_and(|value| value.hyphenated().to_string() == uuid)
 }
 
 pub struct Config {
@@ -414,6 +522,53 @@ mod tests {
         assert_eq!(first, second);
         assert_eq!(marker, "ok");
         drop(connection);
+        std::fs::remove_dir_all(sandbox).unwrap();
+    }
+
+    #[test]
+    fn data_directory_lock_is_exclusive_and_released_on_drop() {
+        let sandbox = unique_test_path("exclusive-lock");
+        let paths = DataPaths::prepare(sandbox.join("data")).unwrap();
+
+        let first = paths.acquire_lock().unwrap();
+        let error = paths.acquire_lock().err().expect("second lock must fail");
+        assert!(error.to_string().contains("另一个 Bot 进程"));
+
+        drop(first);
+        let second = paths.acquire_lock().unwrap();
+        drop(second);
+        std::fs::remove_dir_all(sandbox).unwrap();
+    }
+
+    #[test]
+    fn stale_media_cleanup_only_removes_strict_managed_names() {
+        let sandbox = unique_test_path("stale-media-cleanup");
+        let paths = DataPaths::prepare(sandbox.join("data")).unwrap();
+        let media_id = uuid::Uuid::new_v4().hyphenated().to_string();
+        let lease_id = uuid::Uuid::new_v4().hyphenated().to_string();
+        let uppercase_id = uuid::Uuid::new_v4().hyphenated().to_string();
+        let media_file = paths.media.join(format!("{media_id}.mp4"));
+        let lease_file = paths
+            .media
+            .join(format!("{UPLOAD_LEASE_PREFIX}{lease_id}.jpg"));
+        let unrelated_file = paths.media.join("keep.mp4");
+        let uppercase_extension = paths.media.join(format!("{uppercase_id}.MP4"));
+        let matching_directory = paths.media.join(format!("{media_id}.png"));
+        std::fs::write(&media_file, b"video").unwrap();
+        std::fs::write(&lease_file, b"cover").unwrap();
+        std::fs::write(&unrelated_file, b"keep").unwrap();
+        std::fs::write(&uppercase_extension, b"keep").unwrap();
+        std::fs::create_dir(&matching_directory).unwrap();
+
+        let summary = paths.cleanup_stale_media().unwrap();
+
+        assert_eq!(summary.files, 2);
+        assert_eq!(summary.bytes, 10);
+        assert!(!media_file.exists());
+        assert!(!lease_file.exists());
+        assert!(unrelated_file.exists());
+        assert!(uppercase_extension.exists());
+        assert!(matching_directory.is_dir());
         std::fs::remove_dir_all(sandbox).unwrap();
     }
 
