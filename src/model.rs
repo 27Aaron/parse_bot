@@ -11,40 +11,6 @@ pub(crate) const REVIEWED_WECHAT_MEDIA_HOSTS: &[&str] = &[
     "findermp.video.wechat.com",
 ];
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum MediaVariant {
-    Compatible,
-    Original,
-}
-
-impl MediaVariant {
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Compatible => "compatible",
-            Self::Original => "original",
-        }
-    }
-}
-
-impl fmt::Display for MediaVariant {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
-impl FromStr for MediaVariant {
-    type Err = ();
-
-    fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
-        match value {
-            "compatible" => Ok(Self::Compatible),
-            "original" => Ok(Self::Original),
-            _ => Err(()),
-        }
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum VideoCodec {
@@ -99,9 +65,7 @@ pub struct ResolvedPost {
     pub title: Option<String>,
     pub description: Option<String>,
     pub cover_url: Option<Url>,
-    pub compatible: MediaSource,
-    pub original: Option<MediaSource>,
-    pub candidates: Vec<MediaSource>,
+    pub video: MediaSource,
     pub expires_at: Option<DateTime<Utc>>,
 }
 
@@ -115,22 +79,13 @@ impl fmt::Debug for ResolvedPost {
             .field("author", &self.author)
             .field("title", &self.title)
             .field("has_cover", &self.cover_url.is_some())
-            .field("compatible", &self.compatible)
-            .field("has_original", &self.original.is_some())
-            .field("candidate_count", &self.candidates.len())
+            .field("video", &self.video)
             .field("expires_at", &self.expires_at)
             .finish()
     }
 }
 
 impl ResolvedPost {
-    pub fn source(&self, variant: MediaVariant) -> Option<&MediaSource> {
-        match variant {
-            MediaVariant::Compatible => Some(&self.compatible),
-            MediaVariant::Original => self.original.as_ref(),
-        }
-    }
-
     pub fn display_title(&self) -> String {
         self.title
             .as_deref()

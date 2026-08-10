@@ -4,19 +4,19 @@ use std::{
     time::{Duration, Instant},
 };
 
-use tokio::sync::{Mutex, RwLock, Semaphore};
+use tokio::sync::{Mutex, RwLock, Semaphore, mpsc};
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
 use crate::{
     AppError, Result,
-    media::{MediaDownloader, MediaProbe, decrypt_file_prefix, probe_media},
-    model::{MediaVariant, ResolvedPost, TelegramMediaKind, VideoCodec},
+    media::{DownloadedMedia, MediaDownloader, MediaProbe, decrypt_file_prefix, probe_media},
+    model::{MediaSource, ResolvedPost, TelegramMediaKind, VideoCodec},
     storage::MediaCache,
     telegram::api::{
-        CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, InputFile, Message,
-        TelegramClient, TelegramError, Update, VideoMetadata, escape_html,
+        CallbackQuery, InputFile, Message, TelegramClient, TelegramError, Update, VideoMetadata,
+        escape_html,
     },
     wechat::WechatResolver,
 };
@@ -147,7 +147,7 @@ impl BotService {
                 self.telegram
                     .send_message(
                         chat_id,
-                        "发送微信视频号链接或分享文案，我会解析后让你选择普通画质或原画质。\n\n新文件最大支持 2000 MB；大文件需要自建 telegram-bot-api --local。",
+                        "发送微信视频号链接或分享文案，我会自动下载并发送原画视频。\n\n新文件最大支持 2000 MB；大文件需要自建 telegram-bot-api --local。",
                         None,
                     )
                     .await?;
@@ -212,9 +212,21 @@ impl BotService {
         source_message_id: i64,
         input: &str,
     ) -> Result<()> {
+        if self.active_tasks.lock().await.contains_key(&user_id) {
+            self.telegram
+                .send_message_reply(
+                    chat_id,
+                    "你已经有一个原画视频任务正在运行。",
+                    source_message_id,
+                    None,
+                )
+                .await?;
+            return Ok(());
+        }
+
         let status = self
             .telegram
-            .send_message_reply(chat_id, "正在解析链接…", source_message_id, None)
+            .send_message_reply_html(chat_id, "<b>▎解 析 中...</b>", source_message_id, None)
             .await?;
         let _permit = self
             .resolve_slots
@@ -234,98 +246,14 @@ impl BotService {
         };
 
         let nonce = Uuid::new_v4().simple().to_string();
-        let mut buttons = vec![InlineKeyboardButton::callback(
-            "普通画质",
-            format!("dl:{nonce}:c"),
-        )];
-        if post.original.is_some() {
-            buttons.push(InlineKeyboardButton::callback(
-                "原画质",
-                format!("dl:{nonce}:o"),
-            ));
-        }
-        let keyboard = InlineKeyboardMarkup::new(vec![
-            buttons,
-            vec![InlineKeyboardButton::callback(
-                "取消",
-                format!("cancel:{nonce}"),
-            )],
-        ]);
-        let details = format_post(&post);
-
-        self.pending
-            .write()
+        if let Err(error) = self
+            .telegram
+            .edit_message_text_html(chat_id, status.message_id, "<b>▎下 载 中...</b>", None)
             .await
-            .retain(|_, value| value.expires_at > Instant::now());
-        self.pending.write().await.insert(
-            nonce,
-            PendingDownload {
-                owner_user_id: user_id,
-                chat_id,
-                source_message_id,
-                status_message_id: status.message_id,
-                post,
-                expires_at: Instant::now() + self.callback_ttl,
-            },
-        );
-        self.telegram
-            .edit_message_text(chat_id, status.message_id, &details, Some(&keyboard))
-            .await?;
-        Ok(())
-    }
-
-    async fn handle_callback(&self, callback: CallbackQuery) -> Result<()> {
-        let user_id = callback.sender.id;
-        if !self.is_allowed(user_id) {
-            let _ = self
-                .telegram
-                .answer_callback_query(&callback.id, Some("没有权限"), true)
-                .await;
-            return Ok(());
-        }
-        let data = callback.data.as_deref().ok_or(AppError::Expired)?;
-
-        if let Some(nonce) = data.strip_prefix("cancel:") {
-            return self.cancel_callback(&callback, nonce).await;
+        {
+            warn!(error = %error, "下载状态消息更新失败，任务继续执行");
         }
 
-        let mut parts = data.split(':');
-        if parts.next() != Some("dl") {
-            return Err(AppError::Expired);
-        }
-        let nonce = parts.next().ok_or(AppError::Expired)?;
-        let variant = match parts.next() {
-            Some("c") => MediaVariant::Compatible,
-            Some("o") => MediaVariant::Original,
-            _ => return Err(AppError::Expired),
-        };
-        if parts.next().is_some() {
-            return Err(AppError::Expired);
-        }
-
-        let pending = self.pending.read().await.get(nonce).cloned();
-        let Some(pending) = pending else {
-            self.telegram
-                .answer_callback_query(&callback.id, Some("操作已过期，请重新发送链接"), true)
-                .await?;
-            return Ok(());
-        };
-        if pending.expires_at <= Instant::now() {
-            self.pending.write().await.remove(nonce);
-            return Err(AppError::Expired);
-        }
-        if pending.owner_user_id != user_id || callback.chat_id() != Some(pending.chat_id) {
-            return Err(AppError::Forbidden);
-        }
-        if pending.post.source(variant).is_none() {
-            return Err(AppError::Expired);
-        }
-
-        self.telegram
-            .answer_callback_query(&callback.id, Some("开始处理"), false)
-            .await?;
-
-        let nonce = nonce.to_owned();
         let cancellation = CancellationToken::new();
         let already_active = {
             let mut active = self.active_tasks.lock().await;
@@ -342,16 +270,42 @@ impl BotService {
         };
         if already_active {
             self.telegram
-                .send_message(pending.chat_id, "你已经有一个任务正在运行。", None)
+                .edit_message_text(
+                    chat_id,
+                    status.message_id,
+                    "你已经有一个原画视频任务正在运行。",
+                    None,
+                )
                 .await?;
             return Ok(());
         }
 
+        let active_nonces = self
+            .active_tasks
+            .lock()
+            .await
+            .values()
+            .map(|task| task.nonce.clone())
+            .collect::<HashSet<_>>();
+        self.pending.write().await.retain(|nonce, value| {
+            value.expires_at > Instant::now() || active_nonces.contains(nonce)
+        });
+        let pending = PendingDownload {
+            owner_user_id: user_id,
+            chat_id,
+            source_message_id,
+            status_message_id: status.message_id,
+            post,
+            expires_at: Instant::now() + self.callback_ttl,
+        };
+        self.pending
+            .write()
+            .await
+            .insert(nonce.clone(), pending.clone());
+
         let service = self.clone();
         tokio::spawn(async move {
-            let result = service
-                .run_download(&pending, &nonce, variant, &cancellation)
-                .await;
+            let result = service.run_download(&pending, &cancellation).await;
             {
                 let mut active = service.active_tasks.lock().await;
                 if active.get(&user_id).is_some_and(|task| task.nonce == nonce) {
@@ -370,9 +324,29 @@ impl BotService {
                         None,
                     )
                     .await;
-                error!(error = %error, "媒体任务失败");
+                error!(error = %error, "原画视频任务失败");
             }
         });
+        Ok(())
+    }
+
+    async fn handle_callback(&self, callback: CallbackQuery) -> Result<()> {
+        let user_id = callback.sender.id;
+        if !self.is_allowed(user_id) {
+            let _ = self
+                .telegram
+                .answer_callback_query(&callback.id, Some("没有权限"), true)
+                .await;
+            return Ok(());
+        }
+        let data = callback.data.as_deref().ok_or(AppError::Expired)?;
+
+        if let Some(nonce) = data.strip_prefix("cancel:") {
+            return self.cancel_callback(&callback, nonce).await;
+        }
+        self.telegram
+            .answer_callback_query(&callback.id, Some("画质选择已移除，请重新发送链接"), true)
+            .await?;
         Ok(())
     }
 
@@ -384,13 +358,6 @@ impl BotService {
                 .await?;
             return Ok(());
         };
-        if pending.expires_at <= Instant::now() {
-            self.pending.write().await.remove(nonce);
-            self.telegram
-                .answer_callback_query(&callback.id, Some("操作已经过期"), true)
-                .await?;
-            return Ok(());
-        }
         if pending.owner_user_id != callback.sender.id
             || callback.chat_id() != Some(pending.chat_id)
         {
@@ -406,6 +373,12 @@ impl BotService {
             .cloned();
         if let Some(active) = active {
             active.cancellation.cancel();
+        } else if pending.expires_at <= Instant::now() {
+            self.pending.write().await.remove(nonce);
+            self.telegram
+                .answer_callback_query(&callback.id, Some("操作已经过期"), true)
+                .await?;
+            return Ok(());
         } else {
             self.pending.write().await.remove(nonce);
             self.telegram
@@ -421,8 +394,6 @@ impl BotService {
     async fn run_download(
         &self,
         pending: &PendingDownload,
-        nonce: &str,
-        variant: MediaVariant,
         cancellation: &CancellationToken,
     ) -> Result<()> {
         if cancellation.is_cancelled() {
@@ -431,9 +402,21 @@ impl BotService {
         let caption = format_caption(&pending.post);
         if let Some(cached) = self
             .cache
-            .get(&pending.post.platform, &pending.post.post_id, variant)
+            .get(&pending.post.platform, &pending.post.post_id)
             .await?
         {
+            if let Err(error) = self
+                .telegram
+                .edit_message_text_html(
+                    pending.chat_id,
+                    pending.status_message_id,
+                    "<b>▎发 送 中...</b>",
+                    None,
+                )
+                .await
+            {
+                warn!(error = %error, "缓存发送状态消息更新失败，任务继续执行");
+            }
             let input = InputFile::file_id(cached.file_id.clone())?;
             let cached_send = tokio::select! {
                 _ = cancellation.cancelled() => return Err(AppError::Cancelled),
@@ -456,63 +439,35 @@ impl BotService {
                 }
                 Err(error) if error.error_code() == Some(400) => {
                     self.cache
-                        .remove(&pending.post.platform, &pending.post.post_id, variant)
+                        .remove(&pending.post.platform, &pending.post.post_id)
                         .await?;
+                    self.update_status_html(pending, "<b>▎下 载 中...</b>")
+                        .await;
                 }
                 Err(error) => return Err(error.into()),
             }
         }
 
-        let cancel_keyboard =
-            InlineKeyboardMarkup::single_row(vec![InlineKeyboardButton::callback(
-                "取消",
-                format!("cancel:{nonce}"),
-            )]);
-        self.telegram
-            .edit_message_text(
-                pending.chat_id,
-                pending.status_message_id,
-                "正在下载视频…",
-                Some(&cancel_keyboard),
-            )
-            .await?;
-
-        let mut source = pending
-            .post
-            .source(variant)
-            .cloned()
-            .ok_or(AppError::Expired)?;
+        let mut source = pending.post.video.clone();
         let _permit = tokio::select! {
             _ = cancellation.cancelled() => return Err(AppError::Cancelled),
             permit = self.download_slots.acquire() => permit.map_err(|_| AppError::Cancelled)?,
         };
-        let first_download = tokio::select! {
-            _ = cancellation.cancelled() => return Err(AppError::Cancelled),
-            result = self.downloader.download(&source) => result,
-        };
+        let first_download = self
+            .download_with_status(&source, pending, cancellation)
+            .await;
         let downloaded = match first_download {
             Ok(downloaded) => downloaded,
             Err(AppError::Expired) => {
-                self.telegram
-                    .edit_message_text(
-                        pending.chat_id,
-                        pending.status_message_id,
-                        "下载地址已过期，正在重新解析…",
-                        Some(&cancel_keyboard),
-                    )
-                    .await?;
+                self.update_status_html(pending, "<b>▎解 析 中...</b>")
+                    .await;
                 let refreshed = tokio::select! {
                     _ = cancellation.cancelled() => return Err(AppError::Cancelled),
                     result = self.resolver.resolve_url(&pending.post.canonical_url) => result?,
                 };
-                source = refreshed
-                    .source(variant)
-                    .cloned()
-                    .ok_or(AppError::Expired)?;
-                tokio::select! {
-                    _ = cancellation.cancelled() => return Err(AppError::Cancelled),
-                    result = self.downloader.download(&source) => result?,
-                }
+                source = refreshed.video;
+                self.download_with_status(&source, pending, cancellation)
+                    .await?
             }
             Err(error) => return Err(error),
         };
@@ -528,14 +483,6 @@ impl BotService {
                 });
             }
 
-            self.telegram
-                .edit_message_text(
-                    pending.chat_id,
-                    pending.status_message_id,
-                    "正在检查视频…",
-                    Some(&cancel_keyboard),
-                )
-                .await?;
             if let Some(decode_key) = source.decode_key {
                 tokio::select! {
                     _ = cancellation.cancelled() => return Err(AppError::Cancelled),
@@ -549,14 +496,11 @@ impl BotService {
 
             let kind = telegram_media_kind(probe.codec);
             let video_metadata = telegram_video_metadata(&probe);
-            self.telegram
-                .edit_message_text(
-                    pending.chat_id,
-                    pending.status_message_id,
-                    "正在上传到 Telegram…",
-                    Some(&cancel_keyboard),
-                )
-                .await?;
+            // With a local Bot API `file://` input, TDLib performs the real
+            // Telegram upload internally and exposes no byte progress. Only
+            // the start of the request and its successful completion are real.
+            self.update_status_html(pending, "<b>▎上 传 中...</b>")
+                .await;
 
             let input = InputFile::local_path(&downloaded.path)?;
             let send_result = tokio::select! {
@@ -590,6 +534,16 @@ impl BotService {
                 Err(error) => return Err(error.into()),
             };
 
+            let _ = self
+                .telegram
+                .edit_message_text_html(
+                    pending.chat_id,
+                    pending.status_message_id,
+                    "<b>▎上 传 中... | 100%</b>",
+                    None,
+                )
+                .await;
+
             let ids = sent
                 .media_file_ids()
                 .ok_or_else(|| AppError::Telegram("发送成功但响应缺少 file_id".into()))?;
@@ -598,7 +552,6 @@ impl BotService {
                 .put(
                     &pending.post.platform,
                     &pending.post.post_id,
-                    variant,
                     ids.kind,
                     ids.file_id,
                     Some(ids.file_unique_id),
@@ -608,6 +561,7 @@ impl BotService {
                 warn!(error = %error, "视频已发送，但 file_id 缓存写入失败");
             }
 
+            tokio::time::sleep(Duration::from_millis(500)).await;
             let _ = self
                 .telegram
                 .delete_message(pending.chat_id, pending.status_message_id)
@@ -620,6 +574,57 @@ impl BotService {
             warn!(error = %error, "临时媒体文件清理失败");
         }
         result
+    }
+
+    async fn download_with_status(
+        &self,
+        source: &MediaSource,
+        pending: &PendingDownload,
+        cancellation: &CancellationToken,
+    ) -> Result<DownloadedMedia> {
+        let (progress_sender, mut progress_receiver) = mpsc::unbounded_channel();
+        let download = self
+            .downloader
+            .download_with_progress(source, move |progress| {
+                let _ = progress_sender.send(progress);
+            });
+        tokio::pin!(download);
+
+        let mut last_percent = 0_u8;
+        loop {
+            tokio::select! {
+                biased;
+                _ = cancellation.cancelled() => return Err(AppError::Cancelled),
+                Some(progress) = progress_receiver.recv() => {
+                    if progress.percent > last_percent {
+                        last_percent = progress.percent;
+                        self.update_download_status(pending, progress.percent).await;
+                    }
+                }
+                result = &mut download => {
+                    let downloaded = result?;
+                    if last_percent < 100 {
+                        self.update_download_status(pending, 100).await;
+                    }
+                    return Ok(downloaded);
+                }
+            }
+        }
+    }
+
+    async fn update_download_status(&self, pending: &PendingDownload, percent: u8) {
+        let text = format_download_status(percent);
+        self.update_status_html(pending, &text).await;
+    }
+
+    async fn update_status_html(&self, pending: &PendingDownload, text: &str) {
+        if let Err(error) = self
+            .telegram
+            .edit_message_text_html(pending.chat_id, pending.status_message_id, text, None)
+            .await
+        {
+            warn!(error = %error, "状态消息更新失败，媒体任务继续执行");
+        }
     }
 
     async fn send_media(
@@ -676,14 +681,6 @@ impl BotService {
     }
 }
 
-fn format_post(post: &ResolvedPost) -> String {
-    if post.original.is_some() {
-        format!("{}\n\n请选择下载画质：", post.display_title())
-    } else {
-        format!("{}\n\n该视频暂时只有普通画质可用。", post.display_title())
-    }
-}
-
 fn telegram_media_kind(codec: VideoCodec) -> TelegramMediaKind {
     match codec {
         VideoCodec::H264 | VideoCodec::H265 => TelegramMediaKind::Video,
@@ -707,7 +704,11 @@ fn format_caption(post: &ResolvedPost) -> String {
 fn format_caption_parts(title: &str, source: &str) -> String {
     let title = escape_html(title);
     let source = escape_html(source);
-    format!("{title}\n\n<blockquote><a href=\"{source}\">来源</a></blockquote>")
+    format!("{title}\n\n<b>▎<a href=\"{source}\">Source</a></b>")
+}
+
+fn format_download_status(percent: u8) -> String {
+    format!("<b>▎下 载 中... | {percent}%</b>")
 }
 
 #[cfg(test)]
@@ -752,7 +753,16 @@ mod tests {
                 "标题 <原画> & 测试",
                 "https://weixin.qq.com/sph/example?a=1&b=2"
             ),
-            "标题 &lt;原画&gt; &amp; 测试\n\n<blockquote><a href=\"https://weixin.qq.com/sph/example?a=1&amp;b=2\">来源</a></blockquote>"
+            "标题 &lt;原画&gt; &amp; 测试\n\n<b>▎<a href=\"https://weixin.qq.com/sph/example?a=1&amp;b=2\">Source</a></b>"
         );
+    }
+
+    #[test]
+    fn formats_download_progress_in_fifths() {
+        assert_eq!(format_download_status(20), "<b>▎下 载 中... | 20%</b>");
+        assert_eq!(format_download_status(40), "<b>▎下 载 中... | 40%</b>");
+        assert_eq!(format_download_status(60), "<b>▎下 载 中... | 60%</b>");
+        assert_eq!(format_download_status(80), "<b>▎下 载 中... | 80%</b>");
+        assert_eq!(format_download_status(100), "<b>▎下 载 中... | 100%</b>");
     }
 }

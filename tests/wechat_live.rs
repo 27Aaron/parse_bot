@@ -43,65 +43,23 @@ async fn resolves_wechat_channels_sample() {
         "unexpected canonical share URL"
     );
     assert!(!post.post_id.trim().is_empty(), "missing post identifier");
-    assert!(!post.candidates.is_empty(), "no media candidates returned");
-    assert_safe_media_source(&post.compatible);
-    assert!(
-        post.candidates
-            .iter()
-            .any(|candidate| candidate.url == post.compatible.url),
-        "compatible source is absent from the candidate set"
-    );
+    assert_safe_media_source(&post.video);
 
-    let expected_provenance = if post
-        .candidates
-        .iter()
-        .any(|candidate| candidate.provenance == MediaProvenance::H264)
-    {
-        MediaProvenance::H264
-    } else if post
-        .candidates
-        .iter()
-        .any(|candidate| candidate.provenance == MediaProvenance::Generic)
-    {
-        MediaProvenance::Generic
-    } else {
-        MediaProvenance::H265
-    };
-    assert!(
-        post.compatible.provenance == expected_provenance,
-        "compatible source does not follow H264/generic/H265 preference"
-    );
-
-    if let Some(original) = &post.original {
-        assert_safe_media_source(original);
+    if post.video.provenance == MediaProvenance::DerivedOriginal {
         assert!(
-            original.url != post.compatible.url,
-            "original and compatible sources must differ"
+            post.video.size_hint.is_none(),
+            "derived original must not reuse a candidate size hint"
+        );
+        let query: Vec<_> = post.video.url.query_pairs().collect();
+        assert!(query.len() == 2, "derived original query shape changed");
+        assert!(
+            query[0].0 == "encfilekey" && !query[0].1.is_empty(),
+            "derived original is missing encfilekey"
         );
         assert!(
-            matches!(
-                original.provenance,
-                MediaProvenance::ExplicitOrigin | MediaProvenance::DerivedOriginal
-            ),
-            "unexpected original-source provenance"
+            query[1].0 == "token" && !query[1].1.is_empty(),
+            "derived original is missing token"
         );
-
-        if original.provenance == MediaProvenance::DerivedOriginal {
-            assert!(
-                original.url.host_str() == Some("finder.video.qq.com"),
-                "derived original source has an unexpected host"
-            );
-            let query: Vec<_> = original.url.query_pairs().collect();
-            assert!(query.len() == 2, "derived original query shape changed");
-            assert!(
-                query[0].0 == "encfilekey" && !query[0].1.is_empty(),
-                "derived original is missing encfilekey"
-            );
-            assert!(
-                query[1].0 == "token" && !query[1].1.is_empty(),
-                "derived original is missing token"
-            );
-        }
     }
 }
 

@@ -355,14 +355,6 @@ pub fn derive_original_url(source: &Url) -> Option<Url> {
 
     let file_key = query_value(source, "encfilekey")?;
     let token = query_value(source, "token")?;
-    let pairs = source.query_pairs().collect::<Vec<_>>();
-    if pairs.len() == 2
-        && pairs
-            .iter()
-            .all(|(key, _)| key == "encfilekey" || key == "token")
-    {
-        return None;
-    }
     let mut original = source.clone();
     original.set_query(None);
     original.set_fragment(None);
@@ -371,7 +363,7 @@ pub fn derive_original_url(source: &Url) -> Option<Url> {
         .append_pair("encfilekey", &file_key)
         .append_pair("token", &token);
 
-    (original.as_str() != source.as_str()).then_some(original)
+    Some(original)
 }
 
 fn build_post(
@@ -424,38 +416,37 @@ fn build_post(
         VideoCodec::Unknown,
     );
 
-    let compatible = candidates
-        .iter()
-        .find(|source| source.provenance == MediaProvenance::H264)
-        .or_else(|| {
-            candidates
-                .iter()
-                .find(|source| source.provenance == MediaProvenance::Generic)
-        })
-        .or_else(|| {
-            candidates
-                .iter()
-                .find(|source| source.provenance == MediaProvenance::H265)
-        })
-        .cloned()
-        .ok_or(AppError::NotFound)?;
-
     let explicit_original = candidates
         .iter()
         .find(|source| source.provenance == MediaProvenance::ExplicitOrigin)
-        .filter(|source| source.url != compatible.url)
         .cloned();
-    let original = explicit_original.or_else(|| {
-        derive_original_url(&compatible.url).map(|url| MediaSource {
-            url,
-            codec: compatible.codec,
-            provenance: MediaProvenance::DerivedOriginal,
-            width: compatible.width,
-            height: compatible.height,
-            size_hint: None,
-            decode_key: compatible.decode_key,
+    let video = if let Some(explicit_original) = explicit_original {
+        explicit_original
+    } else {
+        [
+            MediaProvenance::H264,
+            MediaProvenance::H265,
+            MediaProvenance::Generic,
+        ]
+        .into_iter()
+        .filter_map(|provenance| {
+            candidates
+                .iter()
+                .find(|source| source.provenance == provenance)
         })
-    });
+        .find_map(|candidate| {
+            derive_original_url(&candidate.url).map(|url| MediaSource {
+                url,
+                codec: candidate.codec,
+                provenance: MediaProvenance::DerivedOriginal,
+                width: candidate.width,
+                height: candidate.height,
+                size_hint: None,
+                decode_key: candidate.decode_key,
+            })
+        })
+        .ok_or(AppError::OriginalUnavailable)?
+    };
 
     let description = text_at(feed_info, "description").or_else(|| non_empty(parse_data.desc));
     let author = author_info
@@ -479,9 +470,7 @@ fn build_post(
         title: description.clone(),
         description,
         cover_url,
-        compatible,
-        original,
-        candidates,
+        video,
         expires_at,
     })
 }
@@ -730,15 +719,18 @@ mod tests {
     }
 
     #[test]
-    fn does_not_offer_duplicate_or_incomplete_original() {
+    fn normalizes_clean_original_and_rejects_incomplete_urls() {
         let already_clean =
             Url::parse("https://finder.video.qq.com/video.mp4?encfilekey=key&token=token").unwrap();
         let missing = Url::parse("https://finder.video.qq.com/video.mp4?token=token").unwrap();
         let reverse_order =
             Url::parse("https://finder.video.qq.com/video.mp4?token=token&encfilekey=key").unwrap();
-        assert!(derive_original_url(&already_clean).is_none());
+        assert_eq!(derive_original_url(&already_clean).unwrap(), already_clean);
         assert!(derive_original_url(&missing).is_none());
-        assert!(derive_original_url(&reverse_order).is_none());
+        assert_eq!(
+            derive_original_url(&reverse_order).unwrap().query(),
+            Some("encfilekey=key&token=token")
+        );
         let dotted =
             Url::parse("https://finder.video.qq.com./video.mp4?encfilekey=key&token=token")
                 .unwrap();
@@ -753,7 +745,7 @@ mod tests {
     }
 
     #[test]
-    fn builds_post_from_feed_fixture_and_prefers_h264() {
+    fn builds_post_from_feed_fixture_and_derives_original_from_preferred_h264_seed() {
         let normalized = NormalizedShareUrl {
             share_id: "A27pGwf5f9".to_owned(),
             canonical_url: Url::parse("https://weixin.qq.com/sph/A27pGwf5f9").unwrap(),
@@ -793,16 +785,14 @@ mod tests {
         assert_eq!(post.post_id, "export-id");
         assert_eq!(post.author.as_deref(), Some("测试作者"));
         assert_eq!(post.description.as_deref(), Some("测试视频"));
-        assert_eq!(post.compatible.provenance, MediaProvenance::H264);
-        assert_eq!(post.compatible.codec, VideoCodec::H264);
-        assert_eq!(post.compatible.size_hint, Some(123456));
-        let original = post.original.unwrap();
-        assert_eq!(original.provenance, MediaProvenance::DerivedOriginal);
-        assert_eq!(original.url.query(), Some("encfilekey=h&token=t"));
+        assert_eq!(post.video.provenance, MediaProvenance::DerivedOriginal);
+        assert_eq!(post.video.codec, VideoCodec::H264);
+        assert_eq!(post.video.url.query(), Some("encfilekey=h&token=t"));
+        assert_eq!(post.video.size_hint, None);
     }
 
     #[test]
-    fn accepts_root_level_feed_shape_and_explicit_origin() {
+    fn accepts_root_level_feed_shape_and_prefers_explicit_origin() {
         let normalized = NormalizedShareUrl {
             share_id: "A27pGwf5f9".to_owned(),
             canonical_url: Url::parse("https://weixin.qq.com/sph/A27pGwf5f9").unwrap(),
@@ -816,16 +806,78 @@ mod tests {
         };
         let feed = serde_json::json!({
             "feedInfo": {
-                "videoUrl": "https://finder.video.qq.com/compatible.mp4?token=t",
+                "h264VideoInfo": {
+                    "videoUrl": "https://finder.video.qq.com/candidate.mp4?encfilekey=k&token=t&quality=hd"
+                },
                 "originVideoUrl": "https://finder.video.qq.com/original.mp4?token=t"
             }
         });
 
         let post = build_post(normalized, parse_data, feed, "export-id".to_owned()).unwrap();
-        assert_eq!(post.compatible.provenance, MediaProvenance::Generic);
+        assert_eq!(post.video.provenance, MediaProvenance::ExplicitOrigin);
         assert_eq!(
-            post.original.unwrap().provenance,
-            MediaProvenance::ExplicitOrigin
+            post.video.url.as_str(),
+            "https://finder.video.qq.com/original.mp4?token=t"
+        );
+    }
+
+    #[test]
+    fn rejects_a_post_when_original_cannot_be_derived() {
+        let normalized = NormalizedShareUrl {
+            share_id: "A27pGwf5f9".to_owned(),
+            canonical_url: Url::parse("https://weixin.qq.com/sph/A27pGwf5f9").unwrap(),
+        };
+        let parse_data = ParseData {
+            wx_export_id: String::new(),
+            cover_url: String::new(),
+            author: String::new(),
+            desc: String::new(),
+            playable_url: "https://example.invalid/?token=dummy".to_owned(),
+        };
+        let feed = serde_json::json!({
+            "feedInfo": {
+                "videoUrl": "https://finder.video.qq.com/fallback.mp4?token=t",
+                "h265VideoInfo": {
+                    "videoUrl": "https://finder.video.qq.com/h265.mp4?token=t"
+                }
+            }
+        });
+
+        let error = build_post(normalized, parse_data, feed, "export-id".to_owned()).unwrap_err();
+        assert!(matches!(error, AppError::OriginalUnavailable));
+    }
+
+    #[test]
+    fn tries_h265_when_h264_cannot_derive_an_original() {
+        let normalized = NormalizedShareUrl {
+            share_id: "A27pGwf5f9".to_owned(),
+            canonical_url: Url::parse("https://weixin.qq.com/sph/A27pGwf5f9").unwrap(),
+        };
+        let parse_data = ParseData {
+            wx_export_id: String::new(),
+            cover_url: String::new(),
+            author: String::new(),
+            desc: String::new(),
+            playable_url: "https://example.invalid/?token=dummy".to_owned(),
+        };
+        let feed = serde_json::json!({
+            "feedInfo": {
+                "h264VideoInfo": {
+                    "videoUrl": "https://finder.video.qq.com/h264.mp4?token=t"
+                },
+                "h265VideoInfo": {
+                    "videoUrl": "https://finder.video.qq.com/h265.mp4?encfilekey=k&token=t&quality=hd"
+                },
+                "videoUrl": "https://finder.video.qq.com/fallback.mp4?token=t"
+            }
+        });
+
+        let post = build_post(normalized, parse_data, feed, "export-id".to_owned()).unwrap();
+        assert_eq!(post.video.provenance, MediaProvenance::DerivedOriginal);
+        assert_eq!(post.video.codec, VideoCodec::H265);
+        assert_eq!(
+            post.video.url.as_str(),
+            "https://finder.video.qq.com/h265.mp4?encfilekey=k&token=t"
         );
     }
 }

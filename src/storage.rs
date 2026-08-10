@@ -4,12 +4,10 @@ use chrono::{DateTime, Utc};
 use parking_lot::Mutex;
 use rusqlite::{Connection, OptionalExtension, params};
 
-use crate::{
-    AppError, Result,
-    model::{MediaVariant, TelegramMediaKind},
-};
+use crate::{AppError, Result, model::TelegramMediaKind};
 
-const CACHE_SCHEMA_VERSION: i64 = 3;
+const CACHE_SCHEMA_VERSION: i64 = 4;
+const ORIGINAL_VARIANT: &str = "original";
 
 #[derive(Clone)]
 pub struct MediaCache {
@@ -34,33 +32,23 @@ impl MediaCache {
         })
     }
 
-    pub async fn get(
-        &self,
-        platform: &str,
-        post_id: &str,
-        variant: MediaVariant,
-    ) -> Result<Option<CachedTelegramMedia>> {
+    pub async fn get(&self, platform: &str, post_id: &str) -> Result<Option<CachedTelegramMedia>> {
         let cache = self.clone();
         let platform = platform.to_owned();
         let post_id = post_id.to_owned();
-        tokio::task::spawn_blocking(move || cache.get_sync(&platform, &post_id, variant))
+        tokio::task::spawn_blocking(move || cache.get_sync(&platform, &post_id))
             .await
             .map_err(|_| AppError::Database("SQLite 读取任务异常退出".into()))?
     }
 
-    fn get_sync(
-        &self,
-        platform: &str,
-        post_id: &str,
-        variant: MediaVariant,
-    ) -> Result<Option<CachedTelegramMedia>> {
+    fn get_sync(&self, platform: &str, post_id: &str) -> Result<Option<CachedTelegramMedia>> {
         let connection = self.connection.lock();
         let row = connection
             .query_row(
                 "SELECT file_id, file_unique_id, media_kind, created_at
                  FROM telegram_media_cache
                  WHERE platform = ?1 AND post_id = ?2 AND variant = ?3",
-                params![platform, post_id, variant.as_str()],
+                params![platform, post_id, ORIGINAL_VARIANT],
                 |row| {
                     let kind = TelegramMediaKind::from_str(row.get::<_, String>(2)?.as_str())
                         .map_err(|_| {
@@ -96,7 +84,7 @@ impl MediaCache {
                 .execute(
                     "UPDATE telegram_media_cache SET last_used_at = ?4
                      WHERE platform = ?1 AND post_id = ?2 AND variant = ?3",
-                    params![platform, post_id, variant.as_str(), Utc::now().to_rfc3339()],
+                    params![platform, post_id, ORIGINAL_VARIANT, Utc::now().to_rfc3339()],
                 )
                 .map_err(db_error)?;
         }
@@ -107,7 +95,6 @@ impl MediaCache {
         &self,
         platform: &str,
         post_id: &str,
-        variant: MediaVariant,
         kind: TelegramMediaKind,
         file_id: &str,
         file_unique_id: Option<&str>,
@@ -121,7 +108,6 @@ impl MediaCache {
             cache.put_sync(
                 &platform,
                 &post_id,
-                variant,
                 kind,
                 &file_id,
                 file_unique_id.as_deref(),
@@ -135,7 +121,6 @@ impl MediaCache {
         &self,
         platform: &str,
         post_id: &str,
-        variant: MediaVariant,
         kind: TelegramMediaKind,
         file_id: &str,
         file_unique_id: Option<&str>,
@@ -156,7 +141,7 @@ impl MediaCache {
                 params![
                     platform,
                     post_id,
-                    variant.as_str(),
+                    ORIGINAL_VARIANT,
                     kind.as_str(),
                     file_id,
                     file_unique_id,
@@ -167,22 +152,22 @@ impl MediaCache {
         Ok(())
     }
 
-    pub async fn remove(&self, platform: &str, post_id: &str, variant: MediaVariant) -> Result<()> {
+    pub async fn remove(&self, platform: &str, post_id: &str) -> Result<()> {
         let cache = self.clone();
         let platform = platform.to_owned();
         let post_id = post_id.to_owned();
-        tokio::task::spawn_blocking(move || cache.remove_sync(&platform, &post_id, variant))
+        tokio::task::spawn_blocking(move || cache.remove_sync(&platform, &post_id))
             .await
             .map_err(|_| AppError::Database("SQLite 删除任务异常退出".into()))?
     }
 
-    fn remove_sync(&self, platform: &str, post_id: &str, variant: MediaVariant) -> Result<()> {
+    fn remove_sync(&self, platform: &str, post_id: &str) -> Result<()> {
         self.connection
             .lock()
             .execute(
                 "DELETE FROM telegram_media_cache
                  WHERE platform = ?1 AND post_id = ?2 AND variant = ?3",
-                params![platform, post_id, variant.as_str()],
+                params![platform, post_id, ORIGINAL_VARIANT],
             )
             .map_err(db_error)?;
         Ok(())
@@ -212,15 +197,25 @@ fn initialize_connection(connection: &Connection) -> Result<()> {
     let schema_version = connection
         .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
         .map_err(db_error)?;
-    if schema_version < CACHE_SCHEMA_VERSION {
-        // Older releases either cached H.265 originals as documents or sent
-        // them as videos without explicit display dimensions. Invalidate both
-        // forms once so Telegram can rebuild the preview with probed metadata.
+    if schema_version < 3 {
+        // Versions before 3 sent originals without reliable preview metadata.
+        // Invalidate them once so Telegram can rebuild the preview.
         connection
             .execute(
                 "DELETE FROM telegram_media_cache
                  WHERE variant = ?1",
-                params![MediaVariant::Original.as_str()],
+                params![ORIGINAL_VARIANT],
+            )
+            .map_err(db_error)?;
+    }
+    if schema_version < CACHE_SCHEMA_VERSION {
+        // Version 4 only caches the original-quality result. This also removes
+        // compatible/low-quality rows on a direct upgrade from any old version.
+        connection
+            .execute(
+                "DELETE FROM telegram_media_cache
+                 WHERE variant <> ?1",
+                params![ORIGINAL_VARIANT],
             )
             .map_err(db_error)?;
         connection
@@ -239,23 +234,10 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn stores_and_reads_file_id() {
+    async fn cache_operations_only_target_original_variant() {
         let connection = Connection::open_in_memory().unwrap();
-        connection
-            .execute_batch(
-                "CREATE TABLE telegram_media_cache (
-                    platform TEXT NOT NULL,
-                    post_id TEXT NOT NULL,
-                    variant TEXT NOT NULL,
-                    media_kind TEXT NOT NULL,
-                    file_id TEXT NOT NULL,
-                    file_unique_id TEXT,
-                    created_at TEXT NOT NULL,
-                    last_used_at TEXT NOT NULL,
-                    PRIMARY KEY (platform, post_id, variant)
-                );",
-            )
-            .unwrap();
+        initialize_connection(&connection).unwrap();
+        insert_cache_row(&connection, "abc", "compatible", "low-file-id");
         let cache = MediaCache {
             connection: Arc::new(Mutex::new(connection)),
         };
@@ -263,79 +245,88 @@ mod tests {
             .put(
                 "wechat_channels",
                 "abc",
-                MediaVariant::Original,
                 TelegramMediaKind::Document,
-                "file-id",
+                "original-file-id",
                 Some("unique-id"),
             )
             .await
             .unwrap();
 
-        let cached = cache
-            .get("wechat_channels", "abc", MediaVariant::Original)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(cached.file_id, "file-id");
+        let cached = cache.get("wechat_channels", "abc").await.unwrap().unwrap();
+        assert_eq!(cached.file_id, "original-file-id");
         assert_eq!(cached.kind, TelegramMediaKind::Document);
+
+        cache.remove("wechat_channels", "abc").await.unwrap();
+        assert!(cache.get("wechat_channels", "abc").await.unwrap().is_none());
+        let compatible_count: i64 = cache
+            .connection
+            .lock()
+            .query_row(
+                "SELECT COUNT(*) FROM telegram_media_cache
+                 WHERE post_id = 'abc' AND variant = 'compatible'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(compatible_count, 1);
     }
 
     #[test]
-    fn invalidates_legacy_original_media_only_once() {
+    fn direct_upgrade_from_before_v3_invalidates_all_legacy_variants() {
         let connection = Connection::open_in_memory().unwrap();
         initialize_connection(&connection).unwrap();
-        connection.pragma_update(None, "user_version", 0).unwrap();
-
-        for (post_id, variant, kind) in [
-            ("old-original", "original", "document"),
-            ("preview-original", "original", "video"),
-            ("compatible-document", "compatible", "document"),
-        ] {
-            connection
-                .execute(
-                    "INSERT INTO telegram_media_cache (
-                         platform, post_id, variant, media_kind, file_id,
-                         file_unique_id, created_at, last_used_at
-                     ) VALUES ('wechat_channels', ?1, ?2, ?3, 'file-id', NULL,
-                               '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
-                    params![post_id, variant, kind],
-                )
-                .unwrap();
-        }
+        connection.pragma_update(None, "user_version", 2).unwrap();
+        insert_cache_row(&connection, "old-original", "original", "original-id");
+        insert_cache_row(&connection, "old-compatible", "compatible", "low-id");
 
         initialize_connection(&connection).unwrap();
-        let remaining: Vec<String> = {
-            let mut statement = connection
-                .prepare("SELECT post_id FROM telegram_media_cache ORDER BY post_id")
-                .unwrap();
-            statement
-                .query_map([], |row| row.get(0))
-                .unwrap()
-                .collect::<std::result::Result<_, _>>()
-                .unwrap()
-        };
-        assert_eq!(remaining, vec!["compatible-document"]);
+        assert!(cached_post_ids(&connection).is_empty());
+        assert_eq!(schema_version(&connection), CACHE_SCHEMA_VERSION);
+    }
 
+    #[test]
+    fn upgrade_from_v3_preserves_original_and_removes_low_quality_cache() {
+        let connection = Connection::open_in_memory().unwrap();
+        initialize_connection(&connection).unwrap();
+        connection.pragma_update(None, "user_version", 3).unwrap();
+        insert_cache_row(&connection, "valid-original", "original", "original-id");
+        insert_cache_row(&connection, "old-compatible", "compatible", "low-id");
+
+        initialize_connection(&connection).unwrap();
+        assert_eq!(cached_post_ids(&connection), vec!["valid-original"]);
+        assert_eq!(schema_version(&connection), CACHE_SCHEMA_VERSION);
+
+        initialize_connection(&connection).unwrap();
+        assert_eq!(cached_post_ids(&connection), vec!["valid-original"]);
+    }
+
+    fn insert_cache_row(connection: &Connection, post_id: &str, variant: &str, file_id: &str) {
         connection
             .execute(
                 "INSERT INTO telegram_media_cache (
                      platform, post_id, variant, media_kind, file_id,
                      file_unique_id, created_at, last_used_at
-                 ) VALUES ('wechat_channels', 'new-h265-original', 'original',
-                           'document', 'file-id', NULL,
+                 ) VALUES ('wechat_channels', ?1, ?2, 'document', ?3, NULL,
                            '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
-                [],
+                params![post_id, variant, file_id],
             )
             .unwrap();
-        initialize_connection(&connection).unwrap();
-        let retained: i64 = connection
-            .query_row(
-                "SELECT COUNT(*) FROM telegram_media_cache
-                 WHERE post_id = 'new-h265-original'",
-                [],
-                |row| row.get(0),
-            )
+    }
+
+    fn cached_post_ids(connection: &Connection) -> Vec<String> {
+        let mut statement = connection
+            .prepare("SELECT post_id FROM telegram_media_cache ORDER BY post_id")
             .unwrap();
-        assert_eq!(retained, 1);
+        statement
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<std::result::Result<_, _>>()
+            .unwrap()
+    }
+
+    fn schema_version(connection: &Connection) -> i64 {
+        connection
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap()
     }
 }
