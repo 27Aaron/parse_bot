@@ -311,6 +311,105 @@ impl TelegramClient {
         .await
     }
 
+    /// Replaces a bot-authored message with a streamable video whose caption
+    /// contains Telegram-supported HTML.
+    ///
+    /// The input may be either an existing Telegram `file_id` or a local
+    /// `file://` URI created by [`InputFile::local_path`].
+    pub async fn edit_message_video_html(
+        &self,
+        chat_id: i64,
+        message_id: i64,
+        video: &InputFile,
+        caption: Option<&str>,
+        reply_markup: Option<&InlineKeyboardMarkup>,
+    ) -> TelegramResult<Message> {
+        self.edit_message_video_inner(chat_id, message_id, video, caption, None, reply_markup)
+            .await
+    }
+
+    /// Replaces a bot-authored message with an HTML-captioned streamable
+    /// video and supplies its visible dimensions and duration explicitly.
+    pub async fn edit_message_video_html_with_metadata(
+        &self,
+        chat_id: i64,
+        message_id: i64,
+        video: &InputFile,
+        caption: Option<&str>,
+        metadata: VideoMetadata,
+        reply_markup: Option<&InlineKeyboardMarkup>,
+    ) -> TelegramResult<Message> {
+        self.edit_message_video_inner(
+            chat_id,
+            message_id,
+            video,
+            caption,
+            Some(metadata),
+            reply_markup,
+        )
+        .await
+    }
+
+    async fn edit_message_video_inner(
+        &self,
+        chat_id: i64,
+        message_id: i64,
+        video: &InputFile,
+        caption: Option<&str>,
+        metadata: Option<VideoMetadata>,
+        reply_markup: Option<&InlineKeyboardMarkup>,
+    ) -> TelegramResult<Message> {
+        self.call(
+            "editMessageMedia",
+            &EditMessageMediaRequest {
+                chat_id,
+                message_id,
+                media: InputMedia::Video(InputMediaVideo {
+                    media: video,
+                    caption,
+                    parse_mode: Some(HTML_PARSE_MODE),
+                    supports_streaming: true,
+                    width: metadata.map(|value| value.width),
+                    height: metadata.map(|value| value.height),
+                    duration: metadata.and_then(|value| value.duration),
+                }),
+                reply_markup,
+            },
+            None,
+        )
+        .await
+    }
+
+    /// Replaces a bot-authored message with a document whose caption contains
+    /// Telegram-supported HTML.
+    ///
+    /// The input may be either an existing Telegram `file_id` or a local
+    /// `file://` URI created by [`InputFile::local_path`].
+    pub async fn edit_message_document_html(
+        &self,
+        chat_id: i64,
+        message_id: i64,
+        document: &InputFile,
+        caption: Option<&str>,
+        reply_markup: Option<&InlineKeyboardMarkup>,
+    ) -> TelegramResult<Message> {
+        self.call(
+            "editMessageMedia",
+            &EditMessageMediaRequest {
+                chat_id,
+                message_id,
+                media: InputMedia::Document(InputMediaDocument {
+                    media: document,
+                    caption,
+                    parse_mode: Some(HTML_PARSE_MODE),
+                }),
+                reply_markup,
+            },
+            None,
+        )
+        .await
+    }
+
     pub async fn delete_message(&self, chat_id: i64, message_id: i64) -> TelegramResult<bool> {
         self.call(
             "deleteMessage",
@@ -748,7 +847,7 @@ pub fn escape_html(value: &str) -> String {
     escaped
 }
 
-/// Display metadata passed explicitly to Telegram's `sendVideo` method.
+/// Display metadata passed explicitly to Telegram's video send/edit methods.
 ///
 /// Supplying the visible dimensions avoids Telegram inferring the coded width
 /// (for example 1088 instead of 1080) and rendering a portrait H.265 preview
@@ -1056,6 +1155,47 @@ struct EditMessageTextRequest<'a> {
     parse_mode: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     reply_markup: Option<&'a InlineKeyboardMarkup>,
+}
+
+#[derive(Serialize)]
+struct EditMessageMediaRequest<'a> {
+    chat_id: i64,
+    message_id: i64,
+    media: InputMedia<'a>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reply_markup: Option<&'a InlineKeyboardMarkup>,
+}
+
+#[derive(Serialize)]
+#[serde(tag = "type", rename_all = "lowercase")]
+enum InputMedia<'a> {
+    Video(InputMediaVideo<'a>),
+    Document(InputMediaDocument<'a>),
+}
+
+#[derive(Serialize)]
+struct InputMediaVideo<'a> {
+    media: &'a InputFile,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    caption: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    parse_mode: Option<&'a str>,
+    supports_streaming: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    width: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    height: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    duration: Option<u32>,
+}
+
+#[derive(Serialize)]
+struct InputMediaDocument<'a> {
+    media: &'a InputFile,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    caption: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    parse_mode: Option<&'a str>,
 }
 
 #[derive(Serialize)]
@@ -1376,6 +1516,75 @@ mod tests {
         .unwrap();
         assert_eq!(document["parse_mode"], "HTML");
         assert_eq!(document["reply_parameters"]["message_id"], 73);
+    }
+
+    #[test]
+    fn serializes_edit_message_media_video_with_metadata() {
+        let input = InputFile::file_id("cached-video-file-id").unwrap();
+        let keyboard = InlineKeyboardMarkup::single_row(vec![InlineKeyboardButton::url(
+            "来源",
+            "https://example.com",
+        )]);
+        let request = EditMessageMediaRequest {
+            chat_id: 42,
+            message_id: 74,
+            media: InputMedia::Video(InputMediaVideo {
+                media: &input,
+                caption: Some("标题\n<b>▎Source</b>"),
+                parse_mode: Some(HTML_PARSE_MODE),
+                supports_streaming: true,
+                width: Some(1080),
+                height: Some(1920),
+                duration: Some(15),
+            }),
+            reply_markup: Some(&keyboard),
+        };
+
+        let value = serde_json::to_value(request).unwrap();
+        assert_eq!(value["chat_id"], 42);
+        assert_eq!(value["message_id"], 74);
+        assert_eq!(value["media"]["type"], "video");
+        assert_eq!(value["media"]["media"], "cached-video-file-id");
+        assert_eq!(value["media"]["caption"], "标题\n<b>▎Source</b>");
+        assert_eq!(value["media"]["parse_mode"], "HTML");
+        assert_eq!(value["media"]["supports_streaming"], true);
+        assert_eq!(value["media"]["width"], 1080);
+        assert_eq!(value["media"]["height"], 1920);
+        assert_eq!(value["media"]["duration"], 15);
+        assert_eq!(
+            value["reply_markup"]["inline_keyboard"][0][0]["url"],
+            "https://example.com"
+        );
+        assert!(value.get("reply_parameters").is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn serializes_edit_message_media_document_with_local_file_uri() {
+        let input = InputFile::local_path("/tmp/video with spaces.mp4").unwrap();
+        let request = EditMessageMediaRequest {
+            chat_id: 42,
+            message_id: 75,
+            media: InputMedia::Document(InputMediaDocument {
+                media: &input,
+                caption: Some("标题\n<b>▎Source</b>"),
+                parse_mode: Some(HTML_PARSE_MODE),
+            }),
+            reply_markup: None,
+        };
+
+        let value = serde_json::to_value(request).unwrap();
+        assert_eq!(value["media"]["type"], "document");
+        assert_eq!(
+            value["media"]["media"],
+            "file:///tmp/video%20with%20spaces.mp4"
+        );
+        assert_eq!(value["media"]["parse_mode"], "HTML");
+        assert!(value.get("reply_markup").is_none());
+        assert!(value["media"].get("supports_streaming").is_none());
+        assert!(value["media"].get("width").is_none());
+        assert!(value["media"].get("height").is_none());
+        assert!(value["media"].get("duration").is_none());
     }
 
     #[test]

@@ -49,7 +49,6 @@ pub struct BotService {
 #[derive(Clone)]
 struct MediaTask {
     chat_id: i64,
-    source_message_id: i64,
     status_message_id: i64,
     post: Arc<ResolvedPost>,
 }
@@ -714,7 +713,6 @@ impl BotService {
         };
         let media_task = MediaTask {
             chat_id: task.chat_id,
-            source_message_id: task.source_message_id,
             status_message_id,
             post,
         };
@@ -758,28 +756,19 @@ impl BotService {
             self.update_status_html(task, "<b>▎发 送 中...</b>", cancellation)
                 .await;
             let input = InputFile::file_id(cached.file_id.clone())?;
-            let cached_send = tokio::select! {
+            let cached_edit = tokio::select! {
                 _ = cancellation.cancelled() => return Err(AppError::Cancelled),
-                result = self.send_media(
+                result = self.edit_media(
                     task.chat_id,
+                    task.status_message_id,
                     cached.kind,
                     &input,
                     &caption,
-                    task.source_message_id,
                     None,
                 ) => result,
             };
-            match cached_send {
-                Ok(_) => {
-                    tokio::select! {
-                        _ = cancellation.cancelled() => {}
-                        _ = self.telegram.delete_message(
-                            task.chat_id,
-                            task.status_message_id,
-                        ) => {}
-                    }
-                    return Ok(());
-                }
+            match cached_edit {
+                Ok(_) => return Ok(()),
                 Err(error) if error.error_code() == Some(400) => {
                     self.cache
                         .remove(&task.post.platform, &task.post.post_id)
@@ -846,30 +835,30 @@ impl BotService {
                 .await;
 
             let input = InputFile::local_path(&downloaded.path)?;
-            let send_result = tokio::select! {
+            let edit_result = tokio::select! {
                 _ = cancellation.cancelled() => return Err(AppError::Cancelled),
-                result = self.send_media(
+                result = self.edit_media(
                     task.chat_id,
+                    task.status_message_id,
                     kind,
                     &input,
                     &caption,
-                    task.source_message_id,
                     Some(video_metadata),
                 ) => result,
             };
-            let sent = match send_result {
+            let edited = match edit_result {
                 Ok(message) => message,
                 Err(error)
                     if kind == TelegramMediaKind::Video && error.error_code() == Some(400) =>
                 {
                     tokio::select! {
                         _ = cancellation.cancelled() => return Err(AppError::Cancelled),
-                        result = self.send_media(
+                        result = self.edit_media(
                             task.chat_id,
+                            task.status_message_id,
                             TelegramMediaKind::Document,
                             &input,
                             &caption,
-                            task.source_message_id,
                             None,
                         ) => result?,
                     }
@@ -877,36 +866,22 @@ impl BotService {
                 Err(error) => return Err(error.into()),
             };
 
-            self.update_status_html(task, "<b>▎上 传 中... | 100%</b>", cancellation)
-                .await;
-
-            let ids = sent
-                .media_file_ids()
-                .ok_or_else(|| AppError::Telegram("发送成功但响应缺少 file_id".into()))?;
-            if let Err(error) = self
-                .cache
-                .put(
-                    &task.post.platform,
-                    &task.post.post_id,
-                    ids.kind,
-                    ids.file_id,
-                    Some(ids.file_unique_id),
-                )
-                .await
-            {
-                warn!(error = %error, "视频已发送，但 file_id 缓存写入失败");
-            }
-
-            tokio::select! {
-                _ = cancellation.cancelled() => return Err(AppError::Cancelled),
-                _ = tokio::time::sleep(Duration::from_millis(500)) => {}
-            }
-            tokio::select! {
-                _ = cancellation.cancelled() => {}
-                _ = self.telegram.delete_message(
-                    task.chat_id,
-                    task.status_message_id,
-                ) => {}
+            if let Some(ids) = edited.media_file_ids() {
+                if let Err(error) = self
+                    .cache
+                    .put(
+                        &task.post.platform,
+                        &task.post.post_id,
+                        ids.kind,
+                        ids.file_id,
+                        Some(ids.file_unique_id),
+                    )
+                    .await
+                {
+                    warn!(error = %error, "视频已发送，但 file_id 缓存写入失败");
+                }
+            } else {
+                warn!("视频已发送，但 Telegram 响应缺少 file_id，跳过缓存");
             }
             Ok(())
         }
@@ -985,24 +960,24 @@ impl BotService {
         }
     }
 
-    async fn send_media(
+    async fn edit_media(
         &self,
         chat_id: i64,
+        message_id: i64,
         kind: TelegramMediaKind,
         input: &InputFile,
         caption: &str,
-        reply_to_message_id: i64,
         video_metadata: Option<VideoMetadata>,
     ) -> std::result::Result<Message, TelegramError> {
         match kind {
             TelegramMediaKind::Video => match video_metadata {
                 Some(metadata) => {
                     self.telegram
-                        .send_video_reply_html_with_metadata(
+                        .edit_message_video_html_with_metadata(
                             chat_id,
+                            message_id,
                             input,
                             Some(caption),
-                            reply_to_message_id,
                             metadata,
                             None,
                         )
@@ -1010,25 +985,13 @@ impl BotService {
                 }
                 None => {
                     self.telegram
-                        .send_video_reply_html(
-                            chat_id,
-                            input,
-                            Some(caption),
-                            reply_to_message_id,
-                            None,
-                        )
+                        .edit_message_video_html(chat_id, message_id, input, Some(caption), None)
                         .await
                 }
             },
             TelegramMediaKind::Document => {
                 self.telegram
-                    .send_document_reply_html(
-                        chat_id,
-                        input,
-                        Some(caption),
-                        reply_to_message_id,
-                        None,
-                    )
+                    .edit_message_document_html(chat_id, message_id, input, Some(caption), None)
                     .await
             }
         }
