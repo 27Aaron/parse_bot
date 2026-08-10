@@ -27,7 +27,6 @@ updates:
     directory: /
     schedule:
       interval: monthly
-      day: 1
       time: "09:30"
       timezone: Asia/Shanghai
     target-branch: main
