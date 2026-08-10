@@ -4,7 +4,10 @@ use std::{
     io::Write,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 
@@ -34,6 +37,21 @@ const CHANNELS_ORIGIN: &str = "https://channels.weixin.qq.com";
 const CHANNELS_REFERER: &str = "https://channels.weixin.qq.com/";
 const MEDIA_USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
      (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36";
+const PROGRESS_THRESHOLDS: [u8; 5] = [20, 40, 60, 80, 100];
+
+/// Progress reported after source bytes have actually been written to disk.
+///
+/// Events are emitted only when the final media response provides a valid,
+/// non-zero `Content-Length`. `percent` is therefore always one of 20, 40, 60,
+/// 80, or 100 and is never estimated from a parser-provided size hint.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DownloadProgress {
+    pub downloaded_bytes: u64,
+    pub total_bytes: u64,
+    pub percent: u8,
+}
+
+type ProgressCallback = Arc<dyn Fn(DownloadProgress) + Send + Sync + 'static>;
 
 // Keep this deliberately narrow. New Tencent CDN names must be reviewed before
 // being added; accepting all of qq.com would turn redirects into an SSRF surface.
@@ -131,11 +149,52 @@ impl MediaDownloader {
         self.download_url(&source.url, source.size_hint).await
     }
 
+    /// Download a resolved media source and report actual on-disk progress.
+    ///
+    /// The callback is synchronous and should return quickly (for example by
+    /// sending the event through a channel). It is called at most once for each
+    /// 20%, 40%, 60%, 80%, and 100% threshold. If the final response has no trustworthy
+    /// total size, the download still succeeds but no percentage event is sent.
+    pub async fn download_with_progress<F>(
+        &self,
+        source: &MediaSource,
+        on_progress: F,
+    ) -> Result<DownloadedMedia>
+    where
+        F: Fn(DownloadProgress) + Send + Sync + 'static,
+    {
+        self.download_url_with_progress(&source.url, source.size_hint, on_progress)
+            .await
+    }
+
     /// Download a media URL with an optional trusted-or-untrusted size hint.
     pub async fn download_url(&self, url: &Url, size_hint: Option<u64>) -> Result<DownloadedMedia> {
+        self.download_url_with_callback(url, size_hint, None).await
+    }
+
+    /// Download a media URL and report actual on-disk progress.
+    pub async fn download_url_with_progress<F>(
+        &self,
+        url: &Url,
+        size_hint: Option<u64>,
+        on_progress: F,
+    ) -> Result<DownloadedMedia>
+    where
+        F: Fn(DownloadProgress) + Send + Sync + 'static,
+    {
+        self.download_url_with_callback(url, size_hint, Some(Arc::new(on_progress)))
+            .await
+    }
+
+    async fn download_url_with_callback(
+        &self,
+        url: &Url,
+        size_hint: Option<u64>,
+        progress_callback: Option<ProgressCallback>,
+    ) -> Result<DownloadedMedia> {
         timeout(
             self.request_timeout,
-            self.download_url_within_deadline(url, size_hint),
+            self.download_url_within_deadline(url, size_hint, progress_callback),
         )
         .await
         .map_err(|_| AppError::Download("媒体下载总超时".to_owned()))?
@@ -145,6 +204,7 @@ impl MediaDownloader {
         &self,
         url: &Url,
         size_hint: Option<u64>,
+        progress_callback: Option<ProgressCallback>,
     ) -> Result<DownloadedMedia> {
         if let Some(actual) = size_hint.filter(|size| *size > self.max_bytes) {
             return Err(AppError::MediaTooLarge {
@@ -157,16 +217,16 @@ impl MediaDownloader {
         check_response_status(response.status())?;
         reject_encoded_response(&response)?;
 
-        if let Some(actual) = checked_content_length(&response)?
-            && actual > self.max_bytes
-        {
+        let content_length = checked_content_length(&response)?;
+        if let Some(actual) = content_length.filter(|actual| *actual > self.max_bytes) {
             return Err(AppError::MediaTooLarge {
                 actual,
                 limit: self.max_bytes,
             });
         }
 
-        self.stream_response(response).await
+        self.stream_response(response, content_length, progress_callback)
+            .await
     }
 
     async fn follow_redirects(&self, initial_url: Url) -> Result<Response> {
@@ -222,7 +282,12 @@ impl MediaDownloader {
             .map_err(map_reqwest_download_error)
     }
 
-    async fn stream_response(&self, mut response: Response) -> Result<DownloadedMedia> {
+    async fn stream_response(
+        &self,
+        mut response: Response,
+        content_length: Option<u64>,
+        progress_callback: Option<ProgressCallback>,
+    ) -> Result<DownloadedMedia> {
         tokio::fs::create_dir_all(self.shared_dir.as_path())
             .await
             .map_err(|_| AppError::Storage(self.shared_dir.as_ref().clone()))?;
@@ -231,9 +296,11 @@ impl MediaDownloader {
         let pending_file = create_private_file(path.clone()).await?;
         let (sender, mut receiver) = mpsc::channel(4);
         let writer_limit = self.max_bytes;
+        let (progress_reporter, _progress_guard) =
+            ProgressReporter::new(content_length, progress_callback);
 
-        let writer = tokio::task::spawn_blocking(move || -> Result<DownloadedMedia> {
-            write_chunks(pending_file, &mut receiver, writer_limit)
+        let writer = tokio::task::spawn_blocking(move || -> Result<WrittenMedia> {
+            write_chunks(pending_file, &mut receiver, writer_limit, progress_reporter)
         });
 
         let mut streamed_bytes = 0_u64;
@@ -276,11 +343,11 @@ impl MediaDownloader {
             Err(error) => return Err(error),
         };
 
-        if outcome.bytes != streamed_bytes {
+        if outcome.media.bytes != streamed_bytes {
             return Err(AppError::Download("媒体文件写入不完整".to_owned()));
         }
 
-        let disk_bytes = match tokio::fs::metadata(&outcome.path).await {
+        let disk_bytes = match tokio::fs::metadata(&outcome.media.path).await {
             Ok(metadata) => metadata.len(),
             Err(_) => return Err(AppError::Storage(self.shared_dir.as_ref().clone())),
         };
@@ -291,11 +358,27 @@ impl MediaDownloader {
                 limit: self.max_bytes,
             });
         }
-        if disk_bytes != outcome.bytes {
+        if disk_bytes != outcome.media.bytes {
             return Err(AppError::Download("媒体文件落盘大小不一致".to_owned()));
         }
 
-        Ok(outcome)
+        if let Some(expected) = content_length
+            && disk_bytes != expected
+        {
+            return Err(AppError::Download(
+                "媒体文件大小与 Content-Length 不一致".to_owned(),
+            ));
+        }
+
+        let WrittenMedia {
+            media,
+            mut progress_reporter,
+        } = outcome;
+        if let Some(reporter) = &mut progress_reporter {
+            reporter.report_complete(media.bytes);
+        }
+
+        Ok(media)
     }
 }
 
@@ -481,29 +564,115 @@ fn write_chunks(
     mut pending_file: PendingFile,
     receiver: &mut mpsc::Receiver<Vec<u8>>,
     max_bytes: u64,
-) -> Result<DownloadedMedia> {
+    mut progress_reporter: Option<ProgressReporter>,
+) -> Result<WrittenMedia> {
     let mut bytes = 0_u64;
     let mut hasher = Sha256::new();
 
     while let Some(chunk) = receiver.blocking_recv() {
-        bytes = bytes
+        let next_bytes = bytes
             .checked_add(chunk.len() as u64)
             .ok_or(AppError::MediaTooLarge {
                 actual: u64::MAX,
                 limit: max_bytes,
             })?;
-        if bytes > max_bytes {
+        if next_bytes > max_bytes {
             return Err(AppError::MediaTooLarge {
-                actual: bytes,
+                actual: next_bytes,
                 limit: max_bytes,
             });
         }
 
         pending_file.file_mut()?.write_all(&chunk)?;
+        bytes = next_bytes;
         hasher.update(&chunk);
+        if let Some(reporter) = &mut progress_reporter {
+            reporter.report_intermediate(bytes);
+        }
     }
 
-    pending_file.finish(bytes, hex::encode(hasher.finalize()))
+    let media = pending_file.finish(bytes, hex::encode(hasher.finalize()))?;
+    Ok(WrittenMedia {
+        media,
+        progress_reporter,
+    })
+}
+
+struct WrittenMedia {
+    media: DownloadedMedia,
+    progress_reporter: Option<ProgressReporter>,
+}
+
+struct ProgressReporter {
+    callback: ProgressCallback,
+    total_bytes: u64,
+    next_threshold: usize,
+    active: Arc<AtomicBool>,
+}
+
+impl ProgressReporter {
+    fn new(
+        content_length: Option<u64>,
+        callback: Option<ProgressCallback>,
+    ) -> (Option<Self>, Option<ProgressGuard>) {
+        let Some(total_bytes) = content_length.filter(|total| *total > 0) else {
+            return (None, None);
+        };
+        let Some(callback) = callback else {
+            return (None, None);
+        };
+
+        let active = Arc::new(AtomicBool::new(true));
+        (
+            Some(Self {
+                callback,
+                total_bytes,
+                next_threshold: 0,
+                active: Arc::clone(&active),
+            }),
+            Some(ProgressGuard { active }),
+        )
+    }
+
+    fn report_intermediate(&mut self, downloaded_bytes: u64) {
+        self.report_crossed(downloaded_bytes, false);
+    }
+
+    fn report_complete(&mut self, downloaded_bytes: u64) {
+        self.report_crossed(downloaded_bytes, true);
+    }
+
+    fn report_crossed(&mut self, downloaded_bytes: u64, include_complete: bool) {
+        while let Some(&percent) = PROGRESS_THRESHOLDS.get(self.next_threshold) {
+            if percent == 100 && !include_complete {
+                break;
+            }
+            if u128::from(downloaded_bytes) * 100
+                < u128::from(self.total_bytes) * u128::from(percent)
+            {
+                break;
+            }
+
+            self.next_threshold += 1;
+            if self.active.load(Ordering::Acquire) {
+                (self.callback)(DownloadProgress {
+                    downloaded_bytes,
+                    total_bytes: self.total_bytes,
+                    percent,
+                });
+            }
+        }
+    }
+}
+
+struct ProgressGuard {
+    active: Arc<AtomicBool>,
+}
+
+impl Drop for ProgressGuard {
+    fn drop(&mut self) {
+        self.active.store(false, Ordering::Release);
+    }
 }
 
 struct PendingFile {
@@ -563,6 +732,8 @@ fn valid_host_name(host: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Mutex;
+
     use super::*;
 
     fn allowed_hosts() -> HashSet<String> {
@@ -642,5 +813,94 @@ mod tests {
         media.cleanup().await.unwrap();
         assert!(!path.exists());
         std::fs::remove_dir(directory).unwrap();
+    }
+
+    #[test]
+    fn reports_each_crossed_threshold_once_after_writes() {
+        let directory = std::env::temp_dir().join(format!(
+            "parse-bot-progress-test-{}",
+            Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("media");
+        let file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .unwrap();
+        let pending_file = PendingFile::new(path.clone(), file);
+
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let callback_events = Arc::clone(&events);
+        let callback: ProgressCallback = Arc::new(move |progress| {
+            callback_events.lock().unwrap().push(progress);
+        });
+        let (reporter, guard) = ProgressReporter::new(Some(8), Some(callback));
+        let guard = guard.unwrap();
+
+        let (sender, mut receiver) = mpsc::channel(4);
+        sender.try_send(vec![1, 2]).unwrap();
+        sender.try_send(vec![3, 4, 5, 6]).unwrap();
+        sender.try_send(vec![7, 8]).unwrap();
+        drop(sender);
+
+        let mut outcome = write_chunks(pending_file, &mut receiver, 8, reporter).unwrap();
+        assert_eq!(
+            std::fs::read(&outcome.media.path).unwrap(),
+            (1_u8..=8).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            events
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|event| (event.percent, event.downloaded_bytes, event.total_bytes))
+                .collect::<Vec<_>>(),
+            [(20, 2, 8), (40, 6, 8), (60, 6, 8), (80, 8, 8)]
+        );
+
+        outcome
+            .progress_reporter
+            .as_mut()
+            .unwrap()
+            .report_complete(outcome.media.bytes);
+        assert_eq!(
+            events
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|event| event.percent)
+                .collect::<Vec<_>>(),
+            [20, 40, 60, 80, 100]
+        );
+
+        drop(guard);
+        drop(outcome);
+        assert!(!path.exists());
+        std::fs::remove_dir(directory).unwrap();
+    }
+
+    #[test]
+    fn does_not_report_percent_without_a_trusted_total() {
+        let callback: ProgressCallback = Arc::new(|_| panic!("unexpected progress event"));
+        let (reporter, guard) = ProgressReporter::new(None, Some(callback));
+        assert!(reporter.is_none());
+        assert!(guard.is_none());
+    }
+
+    #[test]
+    fn progress_guard_suppresses_events_after_cancellation() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let callback_events = Arc::clone(&events);
+        let callback: ProgressCallback = Arc::new(move |progress| {
+            callback_events.lock().unwrap().push(progress);
+        });
+        let (mut reporter, guard) = ProgressReporter::new(Some(100), Some(callback));
+        drop(guard);
+
+        reporter.as_mut().unwrap().report_intermediate(75);
+        reporter.as_mut().unwrap().report_complete(100);
+
+        assert!(events.lock().unwrap().is_empty());
     }
 }
