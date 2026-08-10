@@ -1,7 +1,6 @@
 # Local-only planning, documentation, and runtime state
 /TODO/
 /data/
-/README.md
 
 # Local environment and secrets
 .env
