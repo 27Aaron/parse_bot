@@ -1,6 +1,6 @@
 use std::{sync::Arc, time::Duration};
 
-use chrono::{DateTime, Utc};
+use chrono::Utc;
 use futures_util::StreamExt;
 use regex::Regex;
 use reqwest::{
@@ -370,7 +370,6 @@ fn build_post(
             .ok_or(AppError::UpstreamChanged)?
     };
     let feed_info = data.get("feedInfo").ok_or(AppError::UpstreamChanged)?;
-    let author_info = data.get("authorInfo");
 
     let mut candidates = Vec::new();
     push_candidate(
@@ -407,18 +406,17 @@ fn build_post(
         direct
     });
 
-    let video = if let Some(direct_source) = direct_source {
-        direct_source
-    } else {
-        [
-            MediaSourceKind::H264,
-            MediaSourceKind::H265,
-            MediaSourceKind::Generic,
-        ]
-        .into_iter()
-        .filter_map(|kind| candidates.iter().find(|source| source.provenance == kind))
-        .find_map(|candidate| {
-            derive_direct_media_url(&candidate.url).map(|url| MediaSource {
+    let mut derived_sources = Vec::new();
+    for candidate in [
+        MediaSourceKind::H264,
+        MediaSourceKind::H265,
+        MediaSourceKind::Generic,
+    ]
+    .into_iter()
+    .filter_map(|kind| candidates.iter().find(|source| source.provenance == kind))
+    {
+        if let Some(url) = derive_direct_media_url(&candidate.url) {
+            let source = MediaSource {
                 url,
                 codec: candidate.codec,
                 provenance: MediaSourceKind::Derived,
@@ -426,35 +424,43 @@ fn build_post(
                 height: candidate.height,
                 size_hint: None,
                 decode_key: candidate.decode_key,
-            })
-        })
-        .ok_or(AppError::MediaUnavailable)?
+            };
+            if !derived_sources
+                .iter()
+                .any(|existing: &MediaSource| sources_are_equivalent(existing, &source))
+            {
+                derived_sources.push(source);
+            }
+        }
+    }
+
+    let (video, fallback_videos) = if let Some(direct_source) = direct_source {
+        let fallback_videos = derived_sources
+            .into_iter()
+            .filter(|source| !sources_are_equivalent(source, &direct_source))
+            .collect();
+        (direct_source, fallback_videos)
+    } else {
+        if derived_sources.is_empty() {
+            return Err(AppError::MediaUnavailable);
+        }
+        let video = derived_sources.remove(0);
+        (video, derived_sources)
     };
 
-    let description = text_at(feed_info, "description").or_else(|| non_empty(parse_data.desc));
-    let author = author_info
-        .and_then(|value| text_at(value, "nickname"))
-        .or_else(|| non_empty(parse_data.author));
+    let title = text_at(feed_info, "description").or_else(|| non_empty(parse_data.desc));
     let cover_url = text_at(feed_info, "coverUrl")
         .or_else(|| non_empty(parse_data.cover_url))
         .and_then(|raw| Url::parse(&raw).ok())
         .filter(is_allowed_media_url);
-    let expires_at = data
-        .get("sceneInfo")
-        .and_then(|value| number_at(value, "expiredTime"))
-        .and_then(|timestamp| i64::try_from(timestamp).ok())
-        .and_then(|timestamp| DateTime::from_timestamp(timestamp, 0));
-
     Ok(ResolvedPost {
         platform: "wechat_channels".into(),
         post_id: non_empty(export_id).unwrap_or(normalized.share_id),
         canonical_url: normalized.canonical_url,
-        author,
-        title: description.clone(),
-        description,
+        title,
         cover_url,
         video,
-        expires_at,
+        fallback_videos,
     })
 }
 
@@ -480,7 +486,7 @@ fn push_source(
     };
     if let Some(existing) = output
         .iter_mut()
-        .find(|existing| existing.url == source.url)
+        .find(|existing| sources_are_equivalent(existing, &source))
     {
         merge_source_metadata(existing, &source, true);
     } else {
@@ -517,20 +523,38 @@ fn matching_candidate<'a>(
     direct: &MediaSource,
     candidates: &'a [MediaSource],
 ) -> Option<&'a MediaSource> {
-    candidates
-        .iter()
-        .find(|candidate| candidate.url == direct.url)
-        .or_else(|| {
-            let direct_url = derive_direct_media_url(&direct.url)?;
-            candidates.iter().find(|candidate| {
-                derive_direct_media_url(&candidate.url).as_ref() == Some(&direct_url)
-            })
+    // An exact URL is the strongest identity, but it is still ambiguous when
+    // the feed attaches different decode keys to the same byte location.
+    if let Some(candidate) =
+        unique_matching_candidate(candidates, |candidate| candidate.url == direct.url)
+    {
+        return Some(candidate);
+    }
+
+    if let Some(direct_url) = derive_direct_media_url(&direct.url)
+        && let Some(candidate) = unique_matching_candidate(candidates, |candidate| {
+            derive_direct_media_url(&candidate.url).as_ref() == Some(&direct_url)
         })
-        .or_else(|| {
-            candidates
-                .iter()
-                .find(|candidate| has_matching_media_identity(&direct.url, &candidate.url))
-        })
+    {
+        return Some(candidate);
+    }
+
+    unique_matching_candidate(candidates, |candidate| {
+        has_matching_media_identity(&direct.url, &candidate.url)
+    })
+}
+
+fn sources_are_equivalent(left: &MediaSource, right: &MediaSource) -> bool {
+    left.url == right.url && left.decode_key == right.decode_key
+}
+
+fn unique_matching_candidate(
+    candidates: &[MediaSource],
+    predicate: impl Fn(&MediaSource) -> bool,
+) -> Option<&MediaSource> {
+    let mut matches = candidates.iter().filter(|candidate| predicate(candidate));
+    let candidate = matches.next()?;
+    matches.next().is_none().then_some(candidate)
 }
 
 fn has_matching_media_identity(left: &Url, right: &Url) -> bool {
@@ -708,8 +732,6 @@ struct ParseData {
     #[serde(default)]
     cover_url: String,
     #[serde(default)]
-    author: String,
-    #[serde(default)]
     desc: String,
     playable_url: String,
 }
@@ -864,7 +886,6 @@ mod tests {
         let parse_data = ParseData {
             wx_export_id: "fallback-export-id".to_owned(),
             cover_url: String::new(),
-            author: "备用作者".to_owned(),
             desc: "备用描述".to_owned(),
             playable_url:
                 "https://channels.weixin.qq.com/finder-preview/pages/feed?token=dummy&eid=export-id"
@@ -894,12 +915,18 @@ mod tests {
 
         let post = build_post(normalized, parse_data, feed, "export-id".to_owned()).unwrap();
         assert_eq!(post.post_id, "export-id");
-        assert_eq!(post.author.as_deref(), Some("测试作者"));
-        assert_eq!(post.description.as_deref(), Some("测试视频"));
+        assert_eq!(post.title.as_deref(), Some("测试视频"));
         assert_eq!(post.video.provenance, MediaSourceKind::Derived);
         assert_eq!(post.video.codec, VideoCodec::H264);
         assert_eq!(post.video.url.query(), Some("encfilekey=h&token=t"));
         assert_eq!(post.video.size_hint, None);
+        assert_eq!(
+            post.fallback_videos
+                .iter()
+                .map(|source| source.codec)
+                .collect::<Vec<_>>(),
+            [VideoCodec::H265, VideoCodec::Unknown]
+        );
     }
 
     #[test]
@@ -911,7 +938,6 @@ mod tests {
         let parse_data = ParseData {
             wx_export_id: String::new(),
             cover_url: String::new(),
-            author: String::new(),
             desc: String::new(),
             playable_url: "https://example.invalid/?token=dummy".to_owned(),
         };
@@ -930,6 +956,8 @@ mod tests {
             post.video.url.as_str(),
             "https://finder.video.qq.com/direct.mp4?token=t"
         );
+        assert_eq!(post.fallback_videos.len(), 1);
+        assert_eq!(post.fallback_videos[0].codec, VideoCodec::H264);
     }
 
     #[test]
@@ -941,7 +969,6 @@ mod tests {
         let parse_data = ParseData {
             wx_export_id: String::new(),
             cover_url: String::new(),
-            author: String::new(),
             desc: String::new(),
             playable_url: "https://example.invalid/?token=dummy".to_owned(),
         };
@@ -979,7 +1006,6 @@ mod tests {
         let parse_data = ParseData {
             wx_export_id: String::new(),
             cover_url: String::new(),
-            author: String::new(),
             desc: String::new(),
             playable_url: "https://example.invalid/?token=dummy".to_owned(),
         };
@@ -1008,6 +1034,80 @@ mod tests {
     }
 
     #[test]
+    fn direct_source_does_not_inherit_an_ambiguous_decode_key() {
+        let normalized = NormalizedShareUrl {
+            share_id: "A27pGwf5f9".to_owned(),
+            canonical_url: Url::parse("https://weixin.qq.com/sph/A27pGwf5f9").unwrap(),
+        };
+        let parse_data = ParseData {
+            wx_export_id: String::new(),
+            cover_url: String::new(),
+            desc: String::new(),
+            playable_url: "https://example.invalid/?token=dummy".to_owned(),
+        };
+        let feed = serde_json::json!({
+            "feedInfo": {
+                "h264VideoInfo": {
+                    "videoUrl": "https://finder.video.qq.com/shared.mp4?encfilekey=h264-key&token=shared-token",
+                    "decodeKey": 111
+                },
+                "h265VideoInfo": {
+                    "videoUrl": "https://finder.video.qq.com/shared.mp4?encfilekey=h265-key&token=shared-token",
+                    "decodeKey": 222
+                },
+                "originVideoUrl": "https://finder.video.qq.com/shared.mp4?token=shared-token"
+            }
+        });
+
+        let post = build_post(normalized, parse_data, feed, "export-id".to_owned()).unwrap();
+        assert_eq!(post.video.provenance, MediaSourceKind::Direct);
+        assert_eq!(post.video.codec, VideoCodec::Unknown);
+        assert_eq!(post.video.decode_key, None);
+    }
+
+    #[test]
+    fn same_url_candidates_keep_distinct_decode_keys_as_fallbacks() {
+        let normalized = NormalizedShareUrl {
+            share_id: "A27pGwf5f9".to_owned(),
+            canonical_url: Url::parse("https://weixin.qq.com/sph/A27pGwf5f9").unwrap(),
+        };
+        let parse_data = ParseData {
+            wx_export_id: String::new(),
+            cover_url: String::new(),
+            desc: String::new(),
+            playable_url: "https://example.invalid/?token=dummy".to_owned(),
+        };
+        let feed = serde_json::json!({
+            "feedInfo": {
+                "h264VideoInfo": {
+                    "videoUrl": "https://finder.video.qq.com/shared.mp4?encfilekey=k&token=t&quality=hd",
+                    "decodeKey": 111
+                },
+                "h265VideoInfo": {
+                    "videoUrl": "https://finder.video.qq.com/shared.mp4?token=t&encfilekey=k&quality=sd",
+                    "decodeKey": 222
+                },
+                "originVideoUrl": "https://finder.video.qq.com/shared.mp4?encfilekey=k&token=t"
+            }
+        });
+
+        let post = build_post(normalized, parse_data, feed, "export-id".to_owned()).unwrap();
+        assert_eq!(post.video.decode_key, None);
+        assert_eq!(
+            post.fallback_videos
+                .iter()
+                .map(|source| (source.codec, source.decode_key))
+                .collect::<Vec<_>>(),
+            [(VideoCodec::H264, Some(111)), (VideoCodec::H265, Some(222))]
+        );
+        assert!(
+            post.fallback_videos
+                .iter()
+                .all(|source| source.url == post.video.url)
+        );
+    }
+
+    #[test]
     fn rejects_a_post_when_no_media_source_can_be_derived() {
         let normalized = NormalizedShareUrl {
             share_id: "A27pGwf5f9".to_owned(),
@@ -1016,7 +1116,6 @@ mod tests {
         let parse_data = ParseData {
             wx_export_id: String::new(),
             cover_url: String::new(),
-            author: String::new(),
             desc: String::new(),
             playable_url: "https://example.invalid/?token=dummy".to_owned(),
         };
@@ -1042,7 +1141,6 @@ mod tests {
         let parse_data = ParseData {
             wx_export_id: String::new(),
             cover_url: String::new(),
-            author: String::new(),
             desc: String::new(),
             playable_url: "https://example.invalid/?token=dummy".to_owned(),
         };

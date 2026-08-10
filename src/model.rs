@@ -1,6 +1,5 @@
 use std::{fmt, str::FromStr};
 
-use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use url::Url;
 
@@ -61,12 +60,10 @@ pub struct ResolvedPost {
     pub platform: String,
     pub post_id: String,
     pub canonical_url: Url,
-    pub author: Option<String>,
     pub title: Option<String>,
-    pub description: Option<String>,
     pub cover_url: Option<Url>,
     pub video: MediaSource,
-    pub expires_at: Option<DateTime<Utc>>,
+    pub fallback_videos: Vec<MediaSource>,
 }
 
 impl fmt::Debug for ResolvedPost {
@@ -76,25 +73,23 @@ impl fmt::Debug for ResolvedPost {
             .field("platform", &self.platform)
             .field("post_id", &self.post_id)
             .field("canonical_url", &"<redacted>")
-            .field("author", &self.author)
             .field("title", &self.title)
             .field("has_cover", &self.cover_url.is_some())
             .field("video", &self.video)
-            .field("expires_at", &self.expires_at)
+            .field("fallback_video_count", &self.fallback_videos.len())
             .finish()
     }
 }
 
 impl ResolvedPost {
+    pub fn media_sources(&self) -> impl Iterator<Item = &MediaSource> {
+        std::iter::once(&self.video).chain(self.fallback_videos.iter())
+    }
+
     pub fn display_title(&self) -> String {
         self.title
             .as_deref()
             .filter(|value| !value.trim().is_empty())
-            .or_else(|| {
-                self.description
-                    .as_deref()
-                    .filter(|value| !value.trim().is_empty())
-            })
             .unwrap_or("微信视频号视频")
             .chars()
             .take(180)
