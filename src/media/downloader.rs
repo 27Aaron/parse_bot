@@ -540,7 +540,7 @@ fn map_reqwest_download_error(error: reqwest::Error) -> AppError {
 }
 
 fn random_task_path(directory: &Path) -> PathBuf {
-    directory.join(format!("{}.mp4", Uuid::new_v4().simple()))
+    directory.join(format!("{}.mp4", Uuid::new_v4().hyphenated()))
 }
 
 async fn create_private_file(path: PathBuf) -> Result<PendingFile> {
@@ -741,6 +741,23 @@ mod tests {
             .iter()
             .map(|host| (*host).to_owned())
             .collect()
+    }
+
+    #[test]
+    fn uses_a_canonical_hyphenated_uuid_for_temporary_video_names() {
+        let path = random_task_path(Path::new("media"));
+        let file_name = path.file_name().unwrap().to_str().unwrap();
+        let uuid = file_name.strip_suffix(".mp4").unwrap();
+
+        assert_eq!(file_name.len(), 40);
+        assert_eq!(uuid.as_bytes()[8], b'-');
+        assert_eq!(uuid.as_bytes()[13], b'-');
+        assert_eq!(uuid.as_bytes()[18], b'-');
+        assert_eq!(uuid.as_bytes()[23], b'-');
+        assert_eq!(
+            Uuid::parse_str(uuid).unwrap().hyphenated().to_string(),
+            uuid
+        );
     }
 
     #[test]
