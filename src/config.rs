@@ -1,16 +1,12 @@
 use std::{
-    collections::HashSet,
     env,
     ffi::OsStr,
     path::{Path, PathBuf},
-    time::Duration,
 };
 
-use crate::{AppError, Result, model::REVIEWED_WECHAT_MEDIA_HOSTS};
+use crate::{AppError, Result};
 
 const DEFAULT_DATA_DIR: &str = "./data";
-const DEFAULT_MEDIA_MAX_BYTES: u64 = 2_000_000_000;
-const DEFAULT_TELEGRAM_HARD_LIMIT: u64 = 2_000_000_000;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DataPaths {
@@ -56,11 +52,6 @@ pub struct Config {
     pub data_paths: DataPaths,
     pub required_channel_id: Option<String>,
     pub wechat_yuanbao_cookie: String,
-    pub wechat_resolve_timeout: Duration,
-    pub wechat_download_timeout: Duration,
-    pub media_max_source_bytes: u64,
-    pub telegram_hard_limit_bytes: u64,
-    pub media_hosts: HashSet<String>,
 }
 
 impl Config {
@@ -82,38 +73,6 @@ impl Config {
         };
 
         let wechat_yuanbao_cookie = required("WECHAT_YUANBAO_COOKIE")?;
-
-        let media_max_source_bytes = parse_u64("MEDIA_MAX_SOURCE_BYTES", DEFAULT_MEDIA_MAX_BYTES)?;
-        let telegram_hard_limit_bytes =
-            parse_u64("TELEGRAM_HARD_LIMIT_BYTES", DEFAULT_TELEGRAM_HARD_LIMIT)?;
-        if telegram_hard_limit_bytes > 2_000_000_000 {
-            return Err(AppError::Config(
-                "TELEGRAM_HARD_LIMIT_BYTES 不能超过官方的 2000000000 字节".into(),
-            ));
-        }
-        let media_hosts = env::var("WECHAT_MEDIA_HOSTS")
-            .unwrap_or_else(|_| REVIEWED_WECHAT_MEDIA_HOSTS.join(","))
-            .split(',')
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(|value| value.to_ascii_lowercase())
-            .collect::<HashSet<_>>();
-        if media_hosts.is_empty() {
-            return Err(AppError::Config("WECHAT_MEDIA_HOSTS 不能为空".into()));
-        }
-
-        let wechat_resolve_timeout_secs = parse_u64("WECHAT_RESOLVE_TIMEOUT_SECS", 30)?;
-        let wechat_download_timeout_secs = parse_u64("WECHAT_DOWNLOAD_TIMEOUT_SECS", 7_200)?;
-        if wechat_resolve_timeout_secs > 300 {
-            return Err(AppError::Config(
-                "WECHAT_RESOLVE_TIMEOUT_SECS 不能超过 300".into(),
-            ));
-        }
-        if wechat_download_timeout_secs > 86_400 {
-            return Err(AppError::Config(
-                "WECHAT_DOWNLOAD_TIMEOUT_SECS 不能超过 86400".into(),
-            ));
-        }
         let data_paths = DataPaths::prepare(data_dir)?;
         Ok(Self {
             telegram_api_id,
@@ -122,11 +81,6 @@ impl Config {
             data_paths,
             required_channel_id,
             wechat_yuanbao_cookie,
-            wechat_resolve_timeout: Duration::from_secs(wechat_resolve_timeout_secs),
-            wechat_download_timeout: Duration::from_secs(wechat_download_timeout_secs),
-            media_max_source_bytes,
-            telegram_hard_limit_bytes,
-            media_hosts,
         })
     }
 }
@@ -327,21 +281,6 @@ fn parse_required_channel_id(value: Option<&str>) -> Result<Option<String>> {
         ));
     }
     Ok(Some(value.to_owned()))
-}
-
-fn parse_u64(name: &str, default: u64) -> Result<u64> {
-    match env::var(name) {
-        Ok(value) if !value.trim().is_empty() => value
-            .trim()
-            .parse::<u64>()
-            .map_err(|_| AppError::Config(format!("{name} 必须是正整数")))
-            .and_then(|value| {
-                (value > 0)
-                    .then_some(value)
-                    .ok_or_else(|| AppError::Config(format!("{name} 必须大于 0")))
-            }),
-        _ => Ok(default),
-    }
 }
 
 #[cfg(test)]

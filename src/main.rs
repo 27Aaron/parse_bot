@@ -3,7 +3,7 @@ use parse_bot::{
     config::Config,
     media::MediaDownloader,
     storage::MediaCache,
-    telegram::{BotService, TdlibConfig, TelegramClient},
+    telegram::{BotService, TELEGRAM_FILE_LIMIT_BYTES, TdlibConfig, TelegramClient},
     wechat::WechatResolver,
 };
 use tokio_util::sync::CancellationToken;
@@ -19,18 +19,9 @@ async fn main() -> Result<()> {
 
     let config = Config::from_env()?;
 
-    let resolver = WechatResolver::new(
-        config.wechat_yuanbao_cookie.clone(),
-        config.wechat_resolve_timeout,
-    )?;
-    let downloader = MediaDownloader::with_options(
-        config.data_paths.media.clone(),
-        config
-            .media_max_source_bytes
-            .min(config.telegram_hard_limit_bytes),
-        config.media_hosts,
-        config.wechat_download_timeout,
-    )?;
+    let resolver = WechatResolver::new(config.wechat_yuanbao_cookie.clone())?;
+    let downloader =
+        MediaDownloader::new(config.data_paths.media.clone(), TELEGRAM_FILE_LIMIT_BYTES)?;
     let cache = MediaCache::open(&config.data_paths.state_database)?;
     let telegram = TelegramClient::connect(TdlibConfig {
         api_id: config.telegram_api_id,
@@ -48,7 +39,6 @@ async fn main() -> Result<()> {
         downloader,
         cache,
         config.required_channel_id,
-        config.telegram_hard_limit_bytes,
     );
 
     let shutdown = CancellationToken::new();

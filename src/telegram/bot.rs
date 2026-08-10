@@ -26,6 +26,8 @@ use crate::{
     wechat::{WechatResolver, extract_share_url},
 };
 
+use super::TELEGRAM_FILE_LIMIT_BYTES;
+
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(30);
 const FORCED_SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
 const COMMAND_CONFIGURATION_TIMEOUT: Duration = Duration::from_secs(30);
@@ -41,7 +43,6 @@ pub struct BotService {
     downloader: MediaDownloader,
     cache: MediaCache,
     required_channel_id: Option<Arc<str>>,
-    telegram_hard_limit: u64,
     scheduler: Arc<Mutex<SchedulerState>>,
     media_slots: Arc<Semaphore>,
     background_tasks: TaskTracker,
@@ -350,14 +351,12 @@ enum QueueAction {
 }
 
 impl BotService {
-    #[allow(clippy::too_many_arguments)]
     pub fn new(
         telegram: TelegramClient,
         resolver: WechatResolver,
         downloader: MediaDownloader,
         cache: MediaCache,
         required_channel_id: Option<String>,
-        telegram_hard_limit: u64,
     ) -> Self {
         Self {
             telegram,
@@ -365,7 +364,6 @@ impl BotService {
             downloader,
             cache,
             required_channel_id: required_channel_id.map(Arc::from),
-            telegram_hard_limit,
             scheduler: Arc::new(Mutex::new(SchedulerState::new())),
             media_slots: Arc::new(Semaphore::new(MEDIA_PIPELINE_CONCURRENCY)),
             background_tasks: TaskTracker::new(),
@@ -1215,10 +1213,10 @@ impl BotService {
             if cancellation.is_cancelled() {
                 return Err(AppError::Cancelled);
             }
-            if downloaded.bytes > self.telegram_hard_limit {
+            if downloaded.bytes > TELEGRAM_FILE_LIMIT_BYTES {
                 return Err(AppError::MediaTooLarge {
                     actual: downloaded.bytes,
-                    limit: self.telegram_hard_limit,
+                    limit: TELEGRAM_FILE_LIMIT_BYTES,
                 });
             }
 

@@ -1,8 +1,9 @@
-use std::{env, path::PathBuf, time::Duration};
+use std::{env, path::PathBuf};
 
 use parse_bot::{
     media::{MediaDownloader, decrypt_file_prefix, probe_media},
     model::{MediaSource, MediaSourceKind, ResolvedPost},
+    telegram::TELEGRAM_FILE_LIMIT_BYTES,
     wechat::WechatResolver,
 };
 use uuid::Uuid;
@@ -54,7 +55,7 @@ async fn resolves_wechat_channels_sample() {
 async fn downloads_decrypts_and_probes_wechat_channels_sample() {
     let post = resolve_sample().await;
     let directory = TestDirectory::new();
-    let downloader = MediaDownloader::new(directory.path(), 2_000_000_000)
+    let downloader = MediaDownloader::new(directory.path(), TELEGRAM_FILE_LIMIT_BYTES)
         .unwrap_or_else(|_| panic!("failed to initialize the live media downloader"));
     let downloaded = downloader
         .download(&post.video)
@@ -95,7 +96,7 @@ async fn resolve_sample() -> ResolvedPost {
         }
     };
 
-    let resolver = WechatResolver::new(cookie, Duration::from_secs(30))
+    let resolver = WechatResolver::new(cookie)
         .unwrap_or_else(|_| panic!("failed to initialize the WeChat resolver"));
     resolver
         .resolve_text(SAMPLE_SHARE_URL)

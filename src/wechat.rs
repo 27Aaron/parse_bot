@@ -30,6 +30,7 @@ const USER_AGENT_VALUE: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) 
 const SEC_CH_UA_VALUE: &str =
     r#""Chromium";v="148", "Google Chrome";v="148", "Not/A)Brand";v="99""#;
 const MAX_JSON_BYTES: usize = 2 * 1024 * 1024;
+const RESOLVE_TIMEOUT: Duration = Duration::from_secs(30);
 #[derive(Clone)]
 pub struct WechatResolver {
     client: Client,
@@ -50,10 +51,9 @@ impl std::fmt::Debug for WechatResolver {
 }
 
 impl WechatResolver {
-    pub fn new(cookie: impl Into<String>, timeout: Duration) -> Result<Self> {
+    pub fn new(cookie: impl Into<String>) -> Result<Self> {
         Self::with_endpoints(
             cookie,
-            timeout,
             Url::parse(PARSE_ENDPOINT).expect("constant parse endpoint must be valid"),
             Url::parse(FEED_ENDPOINT).expect("constant feed endpoint must be valid"),
         )
@@ -61,16 +61,13 @@ impl WechatResolver {
 
     fn with_endpoints(
         cookie: impl Into<String>,
-        timeout: Duration,
         parse_endpoint: Url,
         feed_endpoint: Url,
     ) -> Result<Self> {
+        let timeout = RESOLVE_TIMEOUT;
         let cookie = cookie.into();
         if cookie.trim().is_empty() {
             return Err(AppError::Config("WECHAT_YUANBAO_COOKIE 不能为空".into()));
-        }
-        if timeout.is_zero() {
-            return Err(AppError::Config("视频号解析超时必须大于零".into()));
         }
         for endpoint in [&parse_endpoint, &feed_endpoint] {
             if endpoint.scheme() != "https" && !endpoint_is_loopback_http(endpoint) {
