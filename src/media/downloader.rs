@@ -83,11 +83,11 @@ impl Drop for DownloadedMedia {
     }
 }
 
-/// Downloads media into a shared task directory while enforcing URL, network,
-/// redirect, and byte-count limits.
+/// Downloads media into the configured task workspace while enforcing URL,
+/// network, redirect, and byte-count limits.
 #[derive(Clone, Debug)]
 pub struct MediaDownloader {
-    shared_dir: Arc<PathBuf>,
+    workspace_dir: Arc<PathBuf>,
     max_bytes: u64,
     allowed_hosts: Arc<HashSet<String>>,
     request_timeout: Duration,
@@ -95,7 +95,7 @@ pub struct MediaDownloader {
 
 impl MediaDownloader {
     /// Construct a downloader using the reviewed WeChat media CDN allowlist.
-    pub fn new(shared_dir: impl Into<PathBuf>, max_bytes: u64) -> Result<Self> {
+    pub fn new(workspace_dir: impl Into<PathBuf>, max_bytes: u64) -> Result<Self> {
         if max_bytes == 0 {
             return Err(AppError::Config("媒体下载大小上限必须大于零".to_owned()));
         }
@@ -105,11 +105,11 @@ impl MediaDownloader {
             .map(|host| (*host).to_owned())
             .collect();
 
-        Self::with_options(shared_dir, max_bytes, allowed_hosts, REQUEST_TIMEOUT)
+        Self::with_options(workspace_dir, max_bytes, allowed_hosts, REQUEST_TIMEOUT)
     }
 
     pub fn with_options(
-        shared_dir: impl Into<PathBuf>,
+        workspace_dir: impl Into<PathBuf>,
         max_bytes: u64,
         allowed_hosts: HashSet<String>,
         request_timeout: Duration,
@@ -129,7 +129,7 @@ impl MediaDownloader {
         }
 
         Ok(Self {
-            shared_dir: Arc::new(shared_dir.into()),
+            workspace_dir: Arc::new(workspace_dir.into()),
             max_bytes,
             allowed_hosts: Arc::new(allowed_hosts),
             request_timeout,
@@ -148,7 +148,7 @@ impl MediaDownloader {
         }
 
         Ok(Self {
-            shared_dir: Arc::clone(&self.shared_dir),
+            workspace_dir: Arc::clone(&self.workspace_dir),
             max_bytes: self.max_bytes.min(max_bytes),
             allowed_hosts: Arc::clone(&self.allowed_hosts),
             request_timeout: self.request_timeout,
@@ -304,11 +304,11 @@ impl MediaDownloader {
         content_length: Option<u64>,
         progress_callback: Option<ProgressCallback>,
     ) -> Result<DownloadedMedia> {
-        tokio::fs::create_dir_all(self.shared_dir.as_path())
+        tokio::fs::create_dir_all(self.workspace_dir.as_path())
             .await
-            .map_err(|_| AppError::Storage(self.shared_dir.as_ref().clone()))?;
+            .map_err(|_| AppError::Storage(self.workspace_dir.as_ref().clone()))?;
 
-        let path = random_task_path(self.shared_dir.as_path());
+        let path = random_task_path(self.workspace_dir.as_path());
         let pending_file = create_private_file(path.clone()).await?;
         let (sender, mut receiver) = mpsc::channel(4);
         let writer_limit = self.max_bytes;
@@ -365,7 +365,7 @@ impl MediaDownloader {
 
         let disk_bytes = match tokio::fs::metadata(&outcome.media.path).await {
             Ok(metadata) => metadata.len(),
-            Err(_) => return Err(AppError::Storage(self.shared_dir.as_ref().clone())),
+            Err(_) => return Err(AppError::Storage(self.workspace_dir.as_ref().clone())),
         };
 
         if disk_bytes > self.max_bytes {
@@ -809,10 +809,13 @@ mod tests {
 
         let tighter = downloader.capped(25).unwrap();
         assert_eq!(tighter.max_bytes, 25);
-        assert_eq!(tighter.shared_dir, downloader.shared_dir);
+        assert_eq!(tighter.workspace_dir, downloader.workspace_dir);
         assert_eq!(tighter.allowed_hosts, downloader.allowed_hosts);
         assert_eq!(tighter.request_timeout, downloader.request_timeout);
-        assert!(Arc::ptr_eq(&tighter.shared_dir, &downloader.shared_dir));
+        assert!(Arc::ptr_eq(
+            &tighter.workspace_dir,
+            &downloader.workspace_dir
+        ));
         assert!(Arc::ptr_eq(
             &tighter.allowed_hosts,
             &downloader.allowed_hosts

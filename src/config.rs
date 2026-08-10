@@ -1,30 +1,65 @@
 use std::{
     collections::HashSet,
     env,
+    ffi::OsStr,
     path::{Path, PathBuf},
     time::Duration,
 };
 
 use crate::{AppError, Result, model::REVIEWED_WECHAT_MEDIA_HOSTS};
 
-const DEFAULT_TDLIB_DATA_DIR: &str = "./data/tdlib";
+const DEFAULT_DATA_DIR: &str = "./data";
 const DEFAULT_MEDIA_MAX_BYTES: u64 = 2_000_000_000;
 const DEFAULT_TELEGRAM_HARD_LIMIT: u64 = 2_000_000_000;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DataPaths {
+    pub root: PathBuf,
+    pub state_database: PathBuf,
+    pub media: PathBuf,
+    pub tdlib_database: PathBuf,
+    pub tdlib_files: PathBuf,
+}
+
+impl DataPaths {
+    fn derive(root: PathBuf) -> Self {
+        Self {
+            state_database: root.join("state.db"),
+            media: root.join("media"),
+            tdlib_database: root.join("tdlib").join("database"),
+            tdlib_files: root.join("tdlib").join("files"),
+            root,
+        }
+    }
+
+    fn prepare(configured_root: PathBuf) -> Result<Self> {
+        let root = prepare_data_root(&configured_root)?;
+        let mut paths = Self::derive(root.clone());
+
+        // Prepare the common TDLib parent first so an escaping symlink is
+        // rejected before either of its children can be created through it.
+        prepare_subdirectory(&root, &root.join("tdlib"))?;
+        paths.media = prepare_subdirectory(&root, &paths.media)?;
+        paths.tdlib_database = prepare_subdirectory(&root, &paths.tdlib_database)?;
+        paths.tdlib_files = prepare_subdirectory(&root, &paths.tdlib_files)?;
+        paths.state_database = prepare_database_path(&root, &paths.state_database)?;
+        validate_distinct_paths(&paths)?;
+
+        Ok(paths)
+    }
+}
 
 pub struct Config {
     pub telegram_api_id: i32,
     pub telegram_api_hash: String,
     pub telegram_bot_token: String,
-    pub tdlib_database_dir: PathBuf,
-    pub tdlib_files_dir: PathBuf,
+    pub data_paths: DataPaths,
     pub required_channel_id: Option<String>,
     pub wechat_yuanbao_cookie: String,
     pub wechat_resolve_timeout: Duration,
     pub wechat_download_timeout: Duration,
-    pub media_shared_dir: PathBuf,
     pub media_max_source_bytes: u64,
     pub telegram_hard_limit_bytes: u64,
-    pub database_path: PathBuf,
     pub media_hosts: HashSet<String>,
 }
 
@@ -33,11 +68,8 @@ impl Config {
         let telegram_api_id = parse_telegram_api_id(&required("TELEGRAM_API_ID")?)?;
         let telegram_api_hash = parse_telegram_api_hash(required("TELEGRAM_API_HASH")?)?;
         let telegram_bot_token = required("TELEGRAM_BOT_TOKEN")?;
-        let tdlib_data_dir = env::var_os("TDLIB_DATA_DIR")
-            .filter(|value| !value.is_empty())
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from(DEFAULT_TDLIB_DATA_DIR));
-        let (tdlib_database_dir, tdlib_files_dir) = tdlib_directories(&tdlib_data_dir);
+        let data_dir = env::var_os("DATA_DIR");
+        let data_dir = parse_data_dir(data_dir.as_deref())?;
 
         let required_channel_id = match env::var("REQUIRED_CHANNEL_ID") {
             Ok(value) => parse_required_channel_id(Some(&value))?,
@@ -50,10 +82,6 @@ impl Config {
         };
 
         let wechat_yuanbao_cookie = required("WECHAT_YUANBAO_COOKIE")?;
-        let media_shared_dir = env::var_os("MEDIA_SHARED_DIR")
-            .filter(|value| !value.is_empty())
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("./data/media"));
 
         let media_max_source_bytes = parse_u64("MEDIA_MAX_SOURCE_BYTES", DEFAULT_MEDIA_MAX_BYTES)?;
         let telegram_hard_limit_bytes =
@@ -63,10 +91,6 @@ impl Config {
                 "TELEGRAM_HARD_LIMIT_BYTES 不能超过官方的 2000000000 字节".into(),
             ));
         }
-        let database_path = parse_database_path(
-            &env::var("DATABASE_URL").unwrap_or_else(|_| "sqlite:./data/state.db".into()),
-        )?;
-
         let media_hosts = env::var("WECHAT_MEDIA_HOSTS")
             .unwrap_or_else(|_| REVIEWED_WECHAT_MEDIA_HOSTS.join(","))
             .split(',')
@@ -90,37 +114,20 @@ impl Config {
                 "WECHAT_DOWNLOAD_TIMEOUT_SECS 不能超过 86400".into(),
             ));
         }
+        let data_paths = DataPaths::prepare(data_dir)?;
         Ok(Self {
             telegram_api_id,
             telegram_api_hash,
             telegram_bot_token,
-            tdlib_database_dir,
-            tdlib_files_dir,
+            data_paths,
             required_channel_id,
             wechat_yuanbao_cookie,
             wechat_resolve_timeout: Duration::from_secs(wechat_resolve_timeout_secs),
             wechat_download_timeout: Duration::from_secs(wechat_download_timeout_secs),
-            media_shared_dir,
             media_max_source_bytes,
             telegram_hard_limit_bytes,
-            database_path,
             media_hosts,
         })
-    }
-
-    pub fn prepare_paths(&mut self) -> Result<()> {
-        prepare_directory(&mut self.media_shared_dir)?;
-        prepare_directory(&mut self.tdlib_database_dir)?;
-        prepare_directory(&mut self.tdlib_files_dir)?;
-
-        if let Some(parent) = self
-            .database_path
-            .parent()
-            .filter(|path| !path.as_os_str().is_empty())
-        {
-            std::fs::create_dir_all(parent)?;
-        }
-        Ok(())
     }
 }
 
@@ -143,21 +150,151 @@ fn parse_telegram_api_hash(value: String) -> Result<String> {
     Ok(value.to_owned())
 }
 
-fn tdlib_directories(data_dir: &Path) -> (PathBuf, PathBuf) {
-    (data_dir.join("database"), data_dir.join("files"))
+fn parse_data_dir(value: Option<&OsStr>) -> Result<PathBuf> {
+    let Some(value) = value else {
+        return Ok(PathBuf::from(DEFAULT_DATA_DIR));
+    };
+    if value.is_empty() || value.to_str().is_some_and(|value| value.trim().is_empty()) {
+        return Err(AppError::Config("DATA_DIR 不能为空".into()));
+    }
+    Ok(PathBuf::from(value))
 }
 
-fn prepare_directory(path: &mut PathBuf) -> Result<()> {
-    std::fs::create_dir_all(&*path)?;
+fn prepare_data_root(configured_root: &Path) -> Result<PathBuf> {
+    std::fs::create_dir_all(configured_root)?;
+    if !std::fs::metadata(configured_root)?.is_dir() {
+        return Err(AppError::Config("DATA_DIR 必须指向目录".into()));
+    }
+
+    let root = configured_root
+        .canonicalize()
+        .map_err(|_| AppError::Storage(configured_root.to_path_buf()))?;
+    if root.parent().is_none() {
+        return Err(AppError::Config("DATA_DIR 不能是文件系统根目录".into()));
+    }
+    set_private_directory_permissions(&root)?;
+    Ok(root)
+}
+
+fn prepare_subdirectory(root: &Path, path: &Path) -> Result<PathBuf> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            return Err(AppError::Config(format!(
+                "数据目录不能是符号链接：{}",
+                path.display()
+            )));
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    std::fs::create_dir_all(path)?;
+    if !std::fs::metadata(path)?.is_dir() {
+        return Err(AppError::Config(format!(
+            "数据路径必须指向目录：{}",
+            path.display()
+        )));
+    }
+
+    let canonical = path
+        .canonicalize()
+        .map_err(|_| AppError::Storage(path.to_path_buf()))?;
+    ensure_strictly_within(root, &canonical)?;
+    set_private_directory_permissions(&canonical)?;
+    Ok(canonical)
+}
+
+fn prepare_database_path(root: &Path, path: &Path) -> Result<PathBuf> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() {
+                return Err(AppError::Config(format!(
+                    "SQLite 数据文件不能是符号链接：{}",
+                    path.display()
+                )));
+            }
+            let canonical = path
+                .canonicalize()
+                .map_err(|_| AppError::Storage(path.to_path_buf()))?;
+            ensure_strictly_within(root, &canonical)?;
+            if !std::fs::metadata(&canonical)?.is_file() {
+                return Err(AppError::Config(format!(
+                    "SQLite 数据路径必须指向文件：{}",
+                    path.display()
+                )));
+            }
+            set_private_file_permissions(&canonical)?;
+            Ok(canonical)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            create_private_database_file(path)?;
+            Ok(path.to_path_buf())
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn create_private_database_file(path: &Path) -> Result<()> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true).write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        options.mode(0o600);
+    }
+    options.open(path)?;
+    Ok(())
+}
+
+fn ensure_strictly_within(root: &Path, path: &Path) -> Result<()> {
+    if path == root || !path.starts_with(root) {
+        return Err(AppError::Config(format!(
+            "数据子路径不能位于 DATA_DIR 之外：{}",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+fn validate_distinct_paths(paths: &DataPaths) -> Result<()> {
+    let values = [
+        &paths.state_database,
+        &paths.media,
+        &paths.tdlib_database,
+        &paths.tdlib_files,
+    ];
+    for (index, left) in values.iter().enumerate() {
+        for right in &values[index + 1..] {
+            if left == right || left.starts_with(right) || right.starts_with(left) {
+                return Err(AppError::Config("DATA_DIR 派生的数据路径不能重叠".into()));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn set_private_directory_permissions(path: &Path) -> Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
 
-        std::fs::set_permissions(&*path, std::fs::Permissions::from_mode(0o700))?;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
     }
-    *path = path
-        .canonicalize()
-        .map_err(|_| AppError::Storage(path.clone()))?;
+    #[cfg(not(unix))]
+    let _ = path;
+    Ok(())
+}
+
+fn set_private_file_permissions(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    }
+    #[cfg(not(unix))]
+    let _ = path;
     Ok(())
 }
 
@@ -207,33 +344,19 @@ fn parse_u64(name: &str, default: u64) -> Result<u64> {
     }
 }
 
-fn parse_database_path(value: &str) -> Result<PathBuf> {
-    let path = value
-        .strip_prefix("sqlite:")
-        .ok_or_else(|| AppError::Config("DATABASE_URL 当前只支持 sqlite: 路径".into()))?;
-    if path.is_empty() || path == ":memory:" {
-        return Err(AppError::Config(
-            "DATABASE_URL 必须指向持久化 SQLite 文件".into(),
-        ));
-    }
-    Ok(Path::new(path).to_path_buf())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn parses_sqlite_path() {
-        assert_eq!(
-            parse_database_path("sqlite:./data/state.db").unwrap(),
-            PathBuf::from("./data/state.db")
-        );
+    fn defaults_to_the_application_data_root() {
+        assert_eq!(parse_data_dir(None).unwrap(), PathBuf::from("./data"));
     }
 
     #[test]
-    fn rejects_non_sqlite_database() {
-        assert!(parse_database_path("postgres://localhost/db").is_err());
+    fn rejects_an_explicitly_empty_data_root() {
+        assert!(parse_data_dir(Some(OsStr::new(""))).is_err());
+        assert!(parse_data_dir(Some(OsStr::new("   "))).is_err());
     }
 
     #[test]
@@ -267,33 +390,156 @@ mod tests {
     }
 
     #[test]
-    fn derives_separate_tdlib_directories() {
+    fn derives_every_data_path_from_one_root() {
+        let paths = DataPaths::derive(PathBuf::from("configured-data"));
+
+        assert_eq!(paths.root, PathBuf::from("configured-data"));
         assert_eq!(
-            tdlib_directories(Path::new("./data/tdlib")),
-            (
-                PathBuf::from("./data/tdlib/database"),
-                PathBuf::from("./data/tdlib/files")
-            )
+            paths.state_database,
+            PathBuf::from("configured-data/state.db")
+        );
+        assert_eq!(paths.media, PathBuf::from("configured-data/media"));
+        assert_eq!(
+            paths.tdlib_database,
+            PathBuf::from("configured-data/tdlib/database")
+        );
+        assert_eq!(
+            paths.tdlib_files,
+            PathBuf::from("configured-data/tdlib/files")
         );
     }
 
     #[test]
-    fn prepares_and_canonicalizes_tdlib_directories() {
-        let root =
-            std::env::temp_dir().join(format!("parse-bot-config-test-{}", uuid::Uuid::new_v4()));
-        let data_dir = root.join("parent").join("..").join("tdlib");
-        let (mut database_dir, mut files_dir) = tdlib_directories(&data_dir);
+    fn prepares_and_canonicalizes_all_data_directories() {
+        let sandbox = unique_test_path("prepare");
+        let configured = sandbox.join("parent").join("..").join("data");
+        let paths = DataPaths::prepare(configured).unwrap();
+        let root = sandbox.join("data").canonicalize().unwrap();
 
-        prepare_directory(&mut database_dir).unwrap();
-        prepare_directory(&mut files_dir).unwrap();
+        assert_eq!(paths, DataPaths::derive(root.clone()));
+        for directory in [
+            root.clone(),
+            root.join("media"),
+            root.join("tdlib"),
+            root.join("tdlib/database"),
+            root.join("tdlib/files"),
+        ] {
+            assert!(directory.is_dir(), "missing {}", directory.display());
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
 
-        assert_eq!(
-            database_dir,
-            root.join("tdlib/database").canonicalize().unwrap()
-        );
-        assert_eq!(files_dir, root.join("tdlib/files").canonicalize().unwrap());
+                assert_eq!(
+                    directory.metadata().unwrap().permissions().mode() & 0o777,
+                    0o700
+                );
+            }
+        }
+        assert!(paths.state_database.is_file());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
 
-        std::fs::remove_dir_all(root).unwrap();
+            assert_eq!(
+                paths
+                    .state_database
+                    .metadata()
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
+
+        std::fs::remove_dir_all(sandbox).unwrap();
+    }
+
+    #[test]
+    fn preparing_twice_preserves_the_sqlite_database() {
+        let sandbox = unique_test_path("idempotent");
+        let configured = sandbox.join("data");
+        let first = DataPaths::prepare(configured.clone()).unwrap();
+        let connection = rusqlite::Connection::open(&first.state_database).unwrap();
+        connection
+            .execute_batch("CREATE TABLE marker (value TEXT); INSERT INTO marker VALUES ('ok');")
+            .unwrap();
+        drop(connection);
+
+        let second = DataPaths::prepare(configured).unwrap();
+        let connection = rusqlite::Connection::open(&second.state_database).unwrap();
+        let marker: String = connection
+            .query_row("SELECT value FROM marker", [], |row| row.get(0))
+            .unwrap();
+
+        assert_eq!(first, second);
+        assert_eq!(marker, "ok");
+        drop(connection);
+        std::fs::remove_dir_all(sandbox).unwrap();
+    }
+
+    #[test]
+    fn rejects_a_data_root_that_is_not_a_directory() {
+        let sandbox = unique_test_path("file-root");
+        std::fs::create_dir_all(&sandbox).unwrap();
+        let file = sandbox.join("data");
+        std::fs::write(&file, b"not a directory").unwrap();
+
+        assert!(DataPaths::prepare(file).is_err());
+        std::fs::remove_dir_all(sandbox).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_the_filesystem_root_as_data_root() {
+        assert!(DataPaths::prepare(PathBuf::from("/")).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_a_subdirectory_symlink_that_escapes_the_data_root() {
+        use std::os::unix::fs::symlink;
+
+        let sandbox = unique_test_path("escaping-directory");
+        let root = sandbox.join("data");
+        let outside = sandbox.join("outside");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        symlink(&outside, root.join("media")).unwrap();
+
+        assert!(DataPaths::prepare(root).is_err());
+        std::fs::remove_dir_all(sandbox).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_a_managed_subdirectory_symlink_within_the_data_root() {
+        use std::os::unix::fs::symlink;
+
+        let sandbox = unique_test_path("internal-directory-symlink");
+        let root = sandbox.join("data");
+        let alternate = root.join("alternate-media");
+        std::fs::create_dir_all(&alternate).unwrap();
+        symlink(&alternate, root.join("media")).unwrap();
+
+        assert!(DataPaths::prepare(root).is_err());
+        std::fs::remove_dir_all(sandbox).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_a_database_symlink_that_escapes_the_data_root() {
+        use std::os::unix::fs::symlink;
+
+        let sandbox = unique_test_path("escaping-database");
+        let root = sandbox.join("data");
+        let outside = sandbox.join("outside.db");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(&outside, b"outside").unwrap();
+        symlink(&outside, root.join("state.db")).unwrap();
+
+        assert!(DataPaths::prepare(root).is_err());
+        std::fs::remove_dir_all(sandbox).unwrap();
     }
 
     #[test]
@@ -325,5 +571,9 @@ mod tests {
                 "unexpectedly accepted {value}"
             );
         }
+    }
+
+    fn unique_test_path(label: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("parse-bot-config-{label}-{}", uuid::Uuid::new_v4()))
     }
 }

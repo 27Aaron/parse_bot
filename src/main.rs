@@ -17,28 +17,27 @@ async fn main() -> Result<()> {
     load_local_environment()?;
     init_tracing();
 
-    let mut config = Config::from_env()?;
-    config.prepare_paths()?;
+    let config = Config::from_env()?;
 
     let resolver = WechatResolver::new(
         config.wechat_yuanbao_cookie.clone(),
         config.wechat_resolve_timeout,
     )?;
     let downloader = MediaDownloader::with_options(
-        config.media_shared_dir.clone(),
+        config.data_paths.media.clone(),
         config
             .media_max_source_bytes
             .min(config.telegram_hard_limit_bytes),
         config.media_hosts,
         config.wechat_download_timeout,
     )?;
-    let cache = MediaCache::open(&config.database_path)?;
+    let cache = MediaCache::open(&config.data_paths.state_database)?;
     let telegram = TelegramClient::connect(TdlibConfig {
         api_id: config.telegram_api_id,
         api_hash: config.telegram_api_hash,
         bot_token: config.telegram_bot_token,
-        database_directory: config.tdlib_database_dir,
-        files_directory: config.tdlib_files_dir,
+        database_directory: config.data_paths.tdlib_database,
+        files_directory: config.data_paths.tdlib_files,
         cover_downloader: downloader.clone(),
     })
     .await?;
