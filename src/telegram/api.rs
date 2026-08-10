@@ -19,14 +19,6 @@ const HTML_PARSE_MODE: &str = "HTML";
 
 pub type TelegramResult<T> = std::result::Result<T, TelegramError>;
 
-#[derive(Default)]
-struct SendVideoOptions<'a> {
-    parse_mode: Option<&'a str>,
-    reply_parameters: Option<&'a ReplyParameters>,
-    metadata: Option<VideoMetadata>,
-    reply_markup: Option<&'a InlineKeyboardMarkup>,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum TelegramError {
     #[error("Telegram Bot API configuration is invalid: {reason}")]
@@ -50,7 +42,6 @@ pub enum TelegramError {
         error_code: Option<i64>,
         description: String,
         retry_after: Option<Duration>,
-        migrate_to_chat_id: Option<i64>,
     },
 
     #[error("invalid Telegram input file: {reason}")]
@@ -68,15 +59,6 @@ impl TelegramError {
     pub fn error_code(&self) -> Option<i64> {
         match self {
             Self::Api { error_code, .. } => *error_code,
-            _ => None,
-        }
-    }
-
-    pub fn migrate_to_chat_id(&self) -> Option<i64> {
-        match self {
-            Self::Api {
-                migrate_to_chat_id, ..
-            } => *migrate_to_chat_id,
             _ => None,
         }
     }
@@ -167,6 +149,22 @@ impl TelegramClient {
         self.call("getMe", &EmptyRequest {}, None).await
     }
 
+    pub async fn set_my_commands(
+        &self,
+        commands: &[BotCommand],
+        language_code: Option<&str>,
+    ) -> TelegramResult<bool> {
+        self.call(
+            "setMyCommands",
+            &SetMyCommandsRequest {
+                commands,
+                language_code,
+            },
+            None,
+        )
+        .await
+    }
+
     pub async fn get_chat_member(&self, chat_id: &str, user_id: u64) -> TelegramResult<ChatMember> {
         self.call(
             "getChatMember",
@@ -185,7 +183,7 @@ impl TelegramClient {
             offset,
             limit: 100,
             timeout: timeout_secs,
-            allowed_updates: ["message"],
+            allowed_updates: ["message", "callback_query"],
         };
         let timeout =
             Duration::from_secs(u64::from(timeout_secs)).saturating_add(GET_UPDATES_GRACE);
@@ -199,6 +197,18 @@ impl TelegramClient {
         reply_markup: Option<&InlineKeyboardMarkup>,
     ) -> TelegramResult<Message> {
         self.send_message_inner(chat_id, text, None, None, reply_markup)
+            .await
+    }
+
+    /// Sends a message with Telegram's HTML parse mode without replying to a
+    /// source message.
+    pub async fn send_message_html(
+        &self,
+        chat_id: i64,
+        text: &str,
+        reply_markup: Option<&InlineKeyboardMarkup>,
+    ) -> TelegramResult<Message> {
+        self.send_message_inner(chat_id, text, Some(HTML_PARSE_MODE), None, reply_markup)
             .await
     }
 
@@ -311,32 +321,41 @@ impl TelegramClient {
         .await
     }
 
-    /// Replaces a bot-authored message with a streamable video whose caption
-    /// contains Telegram-supported HTML.
-    ///
-    /// The input may be either an existing Telegram `file_id` or a local
-    /// `file://` URI created by [`InputFile::local_path`].
-    pub async fn edit_message_video_html(
+    /// Replaces a message with an HTML-captioned video and an optional cover
+    /// image.  The cover is passed as Telegram's `cover` input file, so it may
+    /// be a `file_id` or an HTTPS URL accepted by the Bot API.
+    pub async fn edit_message_video_html_with_cover(
         &self,
         chat_id: i64,
         message_id: i64,
         video: &InputFile,
         caption: Option<&str>,
+        cover: Option<&InputFile>,
         reply_markup: Option<&InlineKeyboardMarkup>,
     ) -> TelegramResult<Message> {
-        self.edit_message_video_inner(chat_id, message_id, video, caption, None, reply_markup)
-            .await
+        self.edit_message_video_inner(
+            chat_id,
+            message_id,
+            video,
+            caption,
+            None,
+            cover,
+            reply_markup,
+        )
+        .await
     }
 
-    /// Replaces a bot-authored message with an HTML-captioned streamable
-    /// video and supplies its visible dimensions and duration explicitly.
-    pub async fn edit_message_video_html_with_metadata(
+    /// Replaces a message with an HTML-captioned video, explicit metadata and
+    /// an optional cover image.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn edit_message_video_html_with_metadata_and_cover(
         &self,
         chat_id: i64,
         message_id: i64,
         video: &InputFile,
         caption: Option<&str>,
         metadata: VideoMetadata,
+        cover: Option<&InputFile>,
         reply_markup: Option<&InlineKeyboardMarkup>,
     ) -> TelegramResult<Message> {
         self.edit_message_video_inner(
@@ -345,11 +364,13 @@ impl TelegramClient {
             video,
             caption,
             Some(metadata),
+            cover,
             reply_markup,
         )
         .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn edit_message_video_inner(
         &self,
         chat_id: i64,
@@ -357,6 +378,7 @@ impl TelegramClient {
         video: &InputFile,
         caption: Option<&str>,
         metadata: Option<VideoMetadata>,
+        cover: Option<&InputFile>,
         reply_markup: Option<&InlineKeyboardMarkup>,
     ) -> TelegramResult<Message> {
         self.call(
@@ -372,6 +394,7 @@ impl TelegramClient {
                     width: metadata.map(|value| value.width),
                     height: metadata.map(|value| value.height),
                     duration: metadata.and_then(|value| value.duration),
+                    cover,
                 }),
                 reply_markup,
             },
@@ -441,197 +464,6 @@ impl TelegramClient {
         .await
     }
 
-    pub async fn send_video(
-        &self,
-        chat_id: i64,
-        video: &InputFile,
-        caption: Option<&str>,
-        reply_markup: Option<&InlineKeyboardMarkup>,
-    ) -> TelegramResult<Message> {
-        self.send_video_inner(
-            chat_id,
-            video,
-            caption,
-            SendVideoOptions {
-                reply_markup,
-                ..SendVideoOptions::default()
-            },
-        )
-        .await
-    }
-
-    /// Sends a streamable video whose caption contains Telegram-supported HTML.
-    pub async fn send_video_html(
-        &self,
-        chat_id: i64,
-        video: &InputFile,
-        caption: Option<&str>,
-        reply_markup: Option<&InlineKeyboardMarkup>,
-    ) -> TelegramResult<Message> {
-        self.send_video_inner(
-            chat_id,
-            video,
-            caption,
-            SendVideoOptions {
-                parse_mode: Some(HTML_PARSE_MODE),
-                reply_markup,
-                ..SendVideoOptions::default()
-            },
-        )
-        .await
-    }
-
-    /// Sends an HTML-captioned streamable video as a reply in the same chat.
-    pub async fn send_video_reply_html(
-        &self,
-        chat_id: i64,
-        video: &InputFile,
-        caption: Option<&str>,
-        reply_to_message_id: i64,
-        reply_markup: Option<&InlineKeyboardMarkup>,
-    ) -> TelegramResult<Message> {
-        let reply_parameters = ReplyParameters::new(reply_to_message_id);
-        self.send_video_inner(
-            chat_id,
-            video,
-            caption,
-            SendVideoOptions {
-                parse_mode: Some(HTML_PARSE_MODE),
-                reply_parameters: Some(&reply_parameters),
-                reply_markup,
-                ..SendVideoOptions::default()
-            },
-        )
-        .await
-    }
-
-    /// Sends an HTML-captioned streamable video with explicit display metadata
-    /// as a reply in the same chat.
-    pub async fn send_video_reply_html_with_metadata(
-        &self,
-        chat_id: i64,
-        video: &InputFile,
-        caption: Option<&str>,
-        reply_to_message_id: i64,
-        metadata: VideoMetadata,
-        reply_markup: Option<&InlineKeyboardMarkup>,
-    ) -> TelegramResult<Message> {
-        let reply_parameters = ReplyParameters::new(reply_to_message_id);
-        self.send_video_inner(
-            chat_id,
-            video,
-            caption,
-            SendVideoOptions {
-                parse_mode: Some(HTML_PARSE_MODE),
-                reply_parameters: Some(&reply_parameters),
-                metadata: Some(metadata),
-                reply_markup,
-            },
-        )
-        .await
-    }
-
-    async fn send_video_inner(
-        &self,
-        chat_id: i64,
-        video: &InputFile,
-        caption: Option<&str>,
-        options: SendVideoOptions<'_>,
-    ) -> TelegramResult<Message> {
-        self.call(
-            "sendVideo",
-            &SendVideoRequest {
-                chat_id,
-                video,
-                caption,
-                parse_mode: options.parse_mode,
-                supports_streaming: true,
-                width: options.metadata.map(|value| value.width),
-                height: options.metadata.map(|value| value.height),
-                duration: options.metadata.and_then(|value| value.duration),
-                reply_parameters: options.reply_parameters,
-                reply_markup: options.reply_markup,
-            },
-            None,
-        )
-        .await
-    }
-
-    pub async fn send_document(
-        &self,
-        chat_id: i64,
-        document: &InputFile,
-        caption: Option<&str>,
-        reply_markup: Option<&InlineKeyboardMarkup>,
-    ) -> TelegramResult<Message> {
-        self.send_document_inner(chat_id, document, caption, None, None, reply_markup)
-            .await
-    }
-
-    /// Sends a document whose caption contains Telegram-supported HTML.
-    pub async fn send_document_html(
-        &self,
-        chat_id: i64,
-        document: &InputFile,
-        caption: Option<&str>,
-        reply_markup: Option<&InlineKeyboardMarkup>,
-    ) -> TelegramResult<Message> {
-        self.send_document_inner(
-            chat_id,
-            document,
-            caption,
-            Some(HTML_PARSE_MODE),
-            None,
-            reply_markup,
-        )
-        .await
-    }
-
-    /// Sends an HTML-captioned document as a reply in the same chat.
-    pub async fn send_document_reply_html(
-        &self,
-        chat_id: i64,
-        document: &InputFile,
-        caption: Option<&str>,
-        reply_to_message_id: i64,
-        reply_markup: Option<&InlineKeyboardMarkup>,
-    ) -> TelegramResult<Message> {
-        let reply_parameters = ReplyParameters::new(reply_to_message_id);
-        self.send_document_inner(
-            chat_id,
-            document,
-            caption,
-            Some(HTML_PARSE_MODE),
-            Some(&reply_parameters),
-            reply_markup,
-        )
-        .await
-    }
-
-    async fn send_document_inner(
-        &self,
-        chat_id: i64,
-        document: &InputFile,
-        caption: Option<&str>,
-        parse_mode: Option<&str>,
-        reply_parameters: Option<&ReplyParameters>,
-        reply_markup: Option<&InlineKeyboardMarkup>,
-    ) -> TelegramResult<Message> {
-        self.call(
-            "sendDocument",
-            &SendDocumentRequest {
-                chat_id,
-                document,
-                caption,
-                parse_mode,
-                reply_parameters,
-                reply_markup,
-            },
-            None,
-        )
-        .await
-    }
-
     async fn call<T, B>(
         &self,
         method: &'static str,
@@ -692,7 +524,6 @@ impl TelegramClient {
                         .unwrap_or("Telegram Bot API rejected the request"),
                 ),
                 retry_after: parameters.retry_after.map(Duration::from_secs),
-                migrate_to_chat_id: parameters.migrate_to_chat_id,
             });
         }
 
@@ -757,6 +588,21 @@ pub struct InputFile {
     value: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BotCommand {
+    pub command: String,
+    pub description: String,
+}
+
+impl BotCommand {
+    pub fn new(command: impl Into<String>, description: impl Into<String>) -> Self {
+        Self {
+            command: command.into(),
+            description: description.into(),
+        }
+    }
+}
+
 impl InputFile {
     pub fn file_id(value: impl Into<String>) -> TelegramResult<Self> {
         let value = value.into();
@@ -783,25 +629,22 @@ impl InputFile {
         Ok(Self { value })
     }
 
-    pub fn from_api_value(value: impl Into<String>) -> TelegramResult<Self> {
-        let value = value.into();
-        if !value.starts_with("file://") {
-            return Self::file_id(value);
+    /// Uses an HTTPS URL as an input file.  This is primarily used for a
+    /// Telegram video cover; signed query parameters are preserved.
+    pub fn http_url(url: &Url) -> TelegramResult<Self> {
+        if url.scheme() != "https"
+            || url.host_str().is_none()
+            || url.username() != ""
+            || url.password().is_some()
+            || url.fragment().is_some()
+        {
+            return Err(TelegramError::InvalidInputFile {
+                reason: "remote media URL must be an HTTPS URL without credentials or fragment",
+            });
         }
-
-        let url = Url::parse(&value).map_err(|_| TelegramError::InvalidInputFile {
-            reason: "file URI is invalid",
-        })?;
-        let path = url
-            .to_file_path()
-            .map_err(|_| TelegramError::InvalidInputFile {
-                reason: "file URI does not identify a local path",
-            })?;
-        Self::local_path(path)
-    }
-
-    pub fn as_api_value(&self) -> &str {
-        &self.value
+        Ok(Self {
+            value: url.as_str().to_owned(),
+        })
     }
 
     pub fn is_local(&self) -> bool {
@@ -895,10 +738,6 @@ impl InlineKeyboardMarkup {
             inline_keyboard: rows,
         }
     }
-
-    pub fn single_row(buttons: Vec<InlineKeyboardButton>) -> Self {
-        Self::new(vec![buttons])
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -916,14 +755,6 @@ impl InlineKeyboardButton {
             text: text.into(),
             callback_data: Some(callback_data.into()),
             url: None,
-        }
-    }
-
-    pub fn url(text: impl Into<String>, url: impl Into<String>) -> Self {
-        Self {
-            text: text.into(),
-            callback_data: None,
-            url: Some(url.into()),
         }
     }
 }
@@ -1039,12 +870,6 @@ impl Message {
         self.sender.as_ref().map(|user| user.id)
     }
 
-    pub fn reply_text(&self) -> Option<&str> {
-        self.reply_to_message
-            .as_deref()
-            .and_then(|message| message.text.as_deref())
-    }
-
     pub fn media_file_ids(&self) -> Option<MediaFileIds<'_>> {
         if let Some(video) = &self.video {
             return Some(MediaFileIds {
@@ -1079,26 +904,12 @@ pub struct CallbackQuery {
     pub data: Option<String>,
 }
 
-impl CallbackQuery {
-    pub fn chat_id(&self) -> Option<i64> {
-        self.message.as_ref().map(|message| message.chat.id)
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Update {
     pub update_id: i64,
     pub message: Option<Message>,
     pub edited_message: Option<Message>,
     pub callback_query: Option<CallbackQuery>,
-}
-
-impl Update {
-    pub fn private_text_message(&self) -> Option<&Message> {
-        self.message
-            .as_ref()
-            .filter(|message| message.chat.is_private() && message.text.is_some())
-    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -1112,7 +923,6 @@ struct ApiResponse<T> {
 
 #[derive(Debug, Default, Deserialize)]
 struct ResponseParameters {
-    migrate_to_chat_id: Option<i64>,
     retry_after: Option<u64>,
 }
 
@@ -1131,7 +941,14 @@ struct GetUpdatesRequest<'a> {
     offset: Option<i64>,
     limit: u8,
     timeout: u32,
-    allowed_updates: [&'a str; 1],
+    allowed_updates: [&'a str; 2],
+}
+
+#[derive(Serialize)]
+struct SetMyCommandsRequest<'a> {
+    commands: &'a [BotCommand],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    language_code: Option<&'a str>,
 }
 
 #[derive(Serialize)]
@@ -1187,6 +1004,8 @@ struct InputMediaVideo<'a> {
     height: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     duration: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cover: Option<&'a InputFile>,
 }
 
 #[derive(Serialize)]
@@ -1211,41 +1030,6 @@ struct AnswerCallbackQueryRequest<'a> {
     text: Option<&'a str>,
     show_alert: bool,
     cache_time: u32,
-}
-
-#[derive(Serialize)]
-struct SendVideoRequest<'a> {
-    chat_id: i64,
-    video: &'a InputFile,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    caption: Option<&'a str>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    parse_mode: Option<&'a str>,
-    supports_streaming: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    width: Option<u32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    height: Option<u32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    duration: Option<u32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    reply_parameters: Option<&'a ReplyParameters>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    reply_markup: Option<&'a InlineKeyboardMarkup>,
-}
-
-#[derive(Serialize)]
-struct SendDocumentRequest<'a> {
-    chat_id: i64,
-    document: &'a InputFile,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    caption: Option<&'a str>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    parse_mode: Option<&'a str>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    reply_parameters: Option<&'a ReplyParameters>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    reply_markup: Option<&'a InlineKeyboardMarkup>,
 }
 
 #[cfg(test)]
@@ -1298,12 +1082,27 @@ mod tests {
             offset: Some(101),
             limit: 100,
             timeout: 30,
-            allowed_updates: ["message"],
+            allowed_updates: ["message", "callback_query"],
         };
         let value = serde_json::to_value(request).unwrap();
 
         assert_eq!(value["offset"], 101);
-        assert_eq!(value["allowed_updates"], serde_json::json!(["message"]));
+        assert_eq!(
+            value["allowed_updates"],
+            serde_json::json!(["message", "callback_query"])
+        );
+    }
+
+    #[test]
+    fn serializes_localized_bot_commands() {
+        let request = SetMyCommandsRequest {
+            commands: &[BotCommand::new("start", "Start")],
+            language_code: Some("en"),
+        };
+        let value = serde_json::to_value(request).unwrap();
+        assert_eq!(value["language_code"], "en");
+        assert_eq!(value["commands"][0]["command"], "start");
+        assert_eq!(value["commands"][0]["description"], "Start");
     }
 
     #[test]
@@ -1350,16 +1149,23 @@ mod tests {
 
         let response: ApiResponse<Vec<Update>> = serde_json::from_str(json).unwrap();
         let updates = response.result.unwrap();
-        let message = updates[0].private_text_message().unwrap();
+        let message = updates[0].message.as_ref().unwrap();
+        assert!(message.chat.is_private());
         assert_eq!(message.sender_id(), Some(42));
         assert_eq!(
-            message.reply_text(),
+            message
+                .reply_to_message
+                .as_deref()
+                .and_then(|reply| reply.text.as_deref()),
             Some("https://weixin.qq.com/sph/example")
         );
 
         let callback = updates[1].callback_query.as_ref().unwrap();
         assert_eq!(callback.data.as_deref(), Some("download:nonce"));
-        assert_eq!(callback.chat_id(), Some(42));
+        assert_eq!(
+            callback.message.as_ref().map(|message| message.chat.id),
+            Some(42)
+        );
     }
 
     #[test]
@@ -1424,10 +1230,10 @@ mod tests {
 
     #[test]
     fn serializes_inline_keyboard_and_input_files() {
-        let keyboard = InlineKeyboardMarkup::single_row(vec![InlineKeyboardButton::callback(
+        let keyboard = InlineKeyboardMarkup::new(vec![vec![InlineKeyboardButton::callback(
             "操作",
             "action:nonce",
-        )]);
+        )]]);
         let value = serde_json::to_value(&keyboard).unwrap();
         assert_eq!(
             value["inline_keyboard"][0][0]["callback_data"],
@@ -1482,49 +1288,13 @@ mod tests {
     }
 
     #[test]
-    fn serializes_html_parse_mode_for_media_captions() {
-        let input = InputFile::file_id("cached-file-id").unwrap();
-        let reply_parameters = ReplyParameters::new(73);
-        let video = serde_json::to_value(SendVideoRequest {
-            chat_id: 42,
-            video: &input,
-            caption: Some("标题\n<a href=\"https://example.com\">来源</a>"),
-            parse_mode: Some(HTML_PARSE_MODE),
-            supports_streaming: true,
-            width: Some(1080),
-            height: Some(1920),
-            duration: Some(7),
-            reply_parameters: Some(&reply_parameters),
-            reply_markup: None,
-        })
-        .unwrap();
-        assert_eq!(video["parse_mode"], "HTML");
-        assert_eq!(video["supports_streaming"], true);
-        assert_eq!(video["width"], 1080);
-        assert_eq!(video["height"], 1920);
-        assert_eq!(video["duration"], 7);
-        assert_eq!(video["reply_parameters"]["message_id"], 73);
-
-        let document = serde_json::to_value(SendDocumentRequest {
-            chat_id: 42,
-            document: &input,
-            caption: Some("标题\n<a href=\"https://example.com\">来源</a>"),
-            parse_mode: Some(HTML_PARSE_MODE),
-            reply_parameters: Some(&reply_parameters),
-            reply_markup: None,
-        })
-        .unwrap();
-        assert_eq!(document["parse_mode"], "HTML");
-        assert_eq!(document["reply_parameters"]["message_id"], 73);
-    }
-
-    #[test]
     fn serializes_edit_message_media_video_with_metadata() {
         let input = InputFile::file_id("cached-video-file-id").unwrap();
-        let keyboard = InlineKeyboardMarkup::single_row(vec![InlineKeyboardButton::url(
-            "来源",
-            "https://example.com",
-        )]);
+        let keyboard = InlineKeyboardMarkup::new(vec![vec![InlineKeyboardButton {
+            text: "来源".into(),
+            callback_data: None,
+            url: Some("https://example.com".into()),
+        }]]);
         let request = EditMessageMediaRequest {
             chat_id: 42,
             message_id: 74,
@@ -1536,6 +1306,7 @@ mod tests {
                 width: Some(1080),
                 height: Some(1920),
                 duration: Some(15),
+                cover: None,
             }),
             reply_markup: Some(&keyboard),
         };
@@ -1556,6 +1327,34 @@ mod tests {
             "https://example.com"
         );
         assert!(value.get("reply_parameters").is_none());
+    }
+
+    #[test]
+    fn serializes_edit_message_media_video_cover_url() {
+        let video = InputFile::file_id("video-file-id").unwrap();
+        let cover_url = Url::parse("https://finder.video.qq.com/cover.jpg?token=abc").unwrap();
+        let cover = InputFile::http_url(&cover_url).unwrap();
+        let request = EditMessageMediaRequest {
+            chat_id: 42,
+            message_id: 76,
+            media: InputMedia::Video(InputMediaVideo {
+                media: &video,
+                caption: None,
+                parse_mode: Some(HTML_PARSE_MODE),
+                supports_streaming: true,
+                width: None,
+                height: None,
+                duration: None,
+                cover: Some(&cover),
+            }),
+            reply_markup: None,
+        };
+
+        let value = serde_json::to_value(request).unwrap();
+        assert_eq!(
+            value["media"]["cover"],
+            "https://finder.video.qq.com/cover.jpg?token=abc"
+        );
     }
 
     #[cfg(unix)]
@@ -1585,28 +1384,6 @@ mod tests {
         assert!(value["media"].get("width").is_none());
         assert!(value["media"].get("height").is_none());
         assert!(value["media"].get("duration").is_none());
-    }
-
-    #[test]
-    fn omits_video_display_metadata_when_not_supplied() {
-        let input = InputFile::file_id("cached-file-id").unwrap();
-        let video = serde_json::to_value(SendVideoRequest {
-            chat_id: 42,
-            video: &input,
-            caption: None,
-            parse_mode: None,
-            supports_streaming: true,
-            width: None,
-            height: None,
-            duration: None,
-            reply_parameters: None,
-            reply_markup: None,
-        })
-        .unwrap();
-
-        assert!(video.get("width").is_none());
-        assert!(video.get("height").is_none());
-        assert!(video.get("duration").is_none());
     }
 
     #[test]

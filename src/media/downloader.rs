@@ -19,7 +19,6 @@ use reqwest::{
     },
     redirect::Policy,
 };
-use sha2::{Digest, Sha256};
 use tokio::{sync::mpsc, time::timeout};
 use url::{Host, Url};
 use uuid::Uuid;
@@ -62,8 +61,6 @@ type ProgressCallback = Arc<dyn Fn(DownloadProgress) + Send + Sync + 'static>;
 pub struct DownloadedMedia {
     pub path: PathBuf,
     pub bytes: u64,
-    /// Lower-case SHA-256 of the source bytes before any optional decryption.
-    pub source_sha256: String,
 }
 
 impl DownloadedMedia {
@@ -139,14 +136,11 @@ impl MediaDownloader {
         })
     }
 
-    pub fn max_bytes(&self) -> u64 {
-        self.max_bytes
-    }
-
     /// Download a resolved media source. Its parser-provided size hint is an
     /// early limit only; Content-Length and streamed bytes are checked again.
     pub async fn download(&self, source: &MediaSource) -> Result<DownloadedMedia> {
-        self.download_url(&source.url, source.size_hint).await
+        self.download_url_with_callback(&source.url, source.size_hint, None)
+            .await
     }
 
     /// Download a resolved media source and report actual on-disk progress.
@@ -163,26 +157,7 @@ impl MediaDownloader {
     where
         F: Fn(DownloadProgress) + Send + Sync + 'static,
     {
-        self.download_url_with_progress(&source.url, source.size_hint, on_progress)
-            .await
-    }
-
-    /// Download a media URL with an optional trusted-or-untrusted size hint.
-    pub async fn download_url(&self, url: &Url, size_hint: Option<u64>) -> Result<DownloadedMedia> {
-        self.download_url_with_callback(url, size_hint, None).await
-    }
-
-    /// Download a media URL and report actual on-disk progress.
-    pub async fn download_url_with_progress<F>(
-        &self,
-        url: &Url,
-        size_hint: Option<u64>,
-        on_progress: F,
-    ) -> Result<DownloadedMedia>
-    where
-        F: Fn(DownloadProgress) + Send + Sync + 'static,
-    {
-        self.download_url_with_callback(url, size_hint, Some(Arc::new(on_progress)))
+        self.download_url_with_callback(&source.url, source.size_hint, Some(Arc::new(on_progress)))
             .await
     }
 
@@ -567,7 +542,6 @@ fn write_chunks(
     mut progress_reporter: Option<ProgressReporter>,
 ) -> Result<WrittenMedia> {
     let mut bytes = 0_u64;
-    let mut hasher = Sha256::new();
 
     while let Some(chunk) = receiver.blocking_recv() {
         let next_bytes = bytes
@@ -585,13 +559,12 @@ fn write_chunks(
 
         pending_file.file_mut()?.write_all(&chunk)?;
         bytes = next_bytes;
-        hasher.update(&chunk);
         if let Some(reporter) = &mut progress_reporter {
             reporter.report_intermediate(bytes);
         }
     }
 
-    let media = pending_file.finish(bytes, hex::encode(hasher.finalize()))?;
+    let media = pending_file.finish(bytes)?;
     Ok(WrittenMedia {
         media,
         progress_reporter,
@@ -696,7 +669,7 @@ impl PendingFile {
             .ok_or_else(|| AppError::Download("临时媒体文件已经关闭".to_owned()))
     }
 
-    fn finish(mut self, bytes: u64, source_sha256: String) -> Result<DownloadedMedia> {
+    fn finish(mut self, bytes: u64) -> Result<DownloadedMedia> {
         let file = self.file_mut()?;
         file.flush()?;
         file.sync_all()?;
@@ -705,7 +678,6 @@ impl PendingFile {
         Ok(DownloadedMedia {
             path: self.path.clone(),
             bytes,
-            source_sha256,
         })
     }
 }
@@ -823,7 +795,6 @@ mod tests {
         let media = DownloadedMedia {
             path: path.clone(),
             bytes: 4,
-            source_sha256: "unused".to_owned(),
         };
 
         media.cleanup().await.unwrap();

@@ -36,11 +36,6 @@ impl Config {
             .map_err(|_| AppError::Config("TELEGRAM_BOT_API_URL 不是有效 URL".into()))?;
         validate_local_bot_api_url(&telegram_api_url)?;
 
-        if env::var_os("ALLOWED_USER_IDS").is_some() {
-            return Err(AppError::Config(
-                "ALLOWED_USER_IDS 已移除；请删除它，并按需配置 REQUIRED_CHANNEL_ID".into(),
-            ));
-        }
         let required_channel_id = match env::var("REQUIRED_CHANNEL_ID") {
             Ok(value) => parse_required_channel_id(Some(&value))?,
             Err(env::VarError::NotPresent) => None,

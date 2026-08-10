@@ -4,9 +4,9 @@ use chrono::{DateTime, TimeDelta, Utc};
 use parking_lot::Mutex;
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 
-use crate::{AppError, Result, model::TelegramMediaKind};
+use crate::{AppError, Result, i18n::Language, model::TelegramMediaKind};
 
-const CACHE_SCHEMA_VERSION: i64 = 5;
+const CACHE_SCHEMA_VERSION: i64 = 7;
 const VIDEO_VARIANT: &str = "video";
 const CACHE_MAX_ENTRIES: usize = 10_000;
 const CACHE_MAX_AGE_DAYS: i64 = 180;
@@ -22,6 +22,27 @@ pub struct CachedTelegramMedia {
     pub file_unique_id: Option<String>,
     pub kind: TelegramMediaKind,
     pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UserSettings {
+    pub language: Language,
+    pub show_source: bool,
+    pub show_progress: bool,
+    pub reply_to_source: bool,
+    pub show_video_cover: bool,
+}
+
+impl Default for UserSettings {
+    fn default() -> Self {
+        Self {
+            language: Language::Chinese,
+            show_source: true,
+            show_progress: true,
+            reply_to_source: true,
+            show_video_cover: true,
+        }
+    }
 }
 
 impl MediaCache {
@@ -189,6 +210,96 @@ impl MediaCache {
             .map_err(db_error)?;
         Ok(())
     }
+
+    pub async fn get_user_settings_with_default(
+        &self,
+        user_id: u64,
+        default_language: Language,
+    ) -> Result<UserSettings> {
+        let cache = self.clone();
+        tokio::task::spawn_blocking(move || cache.get_user_settings_sync(user_id, default_language))
+            .await
+            .map_err(|_| AppError::Database("SQLite 读取用户设置任务异常退出".into()))?
+    }
+
+    fn get_user_settings_sync(
+        &self,
+        user_id: u64,
+        default_language: Language,
+    ) -> Result<UserSettings> {
+        let user_id = i64::try_from(user_id)
+            .map_err(|_| AppError::Database("Telegram 用户 ID 超出 SQLite 支持范围".into()))?;
+        let connection = self.connection.lock();
+        let row = connection
+            .query_row(
+                "SELECT language, show_source, show_progress,
+                        reply_to_source, show_video_cover
+                 FROM telegram_user_settings WHERE user_id = ?1",
+                params![user_id],
+                |row| {
+                    let language = row.get::<_, String>(0)?;
+                    Ok(UserSettings {
+                        language: Language::from_code(&language).unwrap_or_default(),
+                        show_source: row.get::<_, i64>(1)? != 0,
+                        show_progress: row.get::<_, i64>(2)? != 0,
+                        reply_to_source: row.get::<_, i64>(3)? != 0,
+                        show_video_cover: row.get::<_, i64>(4)? != 0,
+                    })
+                },
+            )
+            .optional()
+            .map_err(db_error)?;
+        Ok(row.unwrap_or(UserSettings {
+            language: default_language,
+            ..UserSettings::default()
+        }))
+    }
+
+    pub async fn put_user_settings(&self, user_id: u64, settings: UserSettings) -> Result<()> {
+        let cache = self.clone();
+        tokio::task::spawn_blocking(move || cache.put_user_settings_sync(user_id, settings))
+            .await
+            .map_err(|_| AppError::Database("SQLite 写入用户设置任务异常退出".into()))?
+    }
+
+    fn put_user_settings_sync(&self, user_id: u64, settings: UserSettings) -> Result<()> {
+        let user_id = i64::try_from(user_id)
+            .map_err(|_| AppError::Database("Telegram 用户 ID 超出 SQLite 支持范围".into()))?;
+        self.connection
+            .lock()
+            .execute(
+                "INSERT INTO telegram_user_settings (
+                     user_id, language, show_source, show_progress,
+                     reply_to_source, show_video_cover, updated_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                 ON CONFLICT(user_id) DO UPDATE SET
+                     language = excluded.language,
+                     show_source = excluded.show_source,
+                     show_progress = excluded.show_progress,
+                     reply_to_source = excluded.reply_to_source,
+                     show_video_cover = excluded.show_video_cover,
+                     updated_at = excluded.updated_at",
+                params![
+                    user_id,
+                    settings.language.code(),
+                    if settings.show_source { 1_i64 } else { 0_i64 },
+                    if settings.show_progress { 1_i64 } else { 0_i64 },
+                    if settings.reply_to_source {
+                        1_i64
+                    } else {
+                        0_i64
+                    },
+                    if settings.show_video_cover {
+                        1_i64
+                    } else {
+                        0_i64
+                    },
+                    Utc::now().to_rfc3339(),
+                ],
+            )
+            .map_err(db_error)?;
+        Ok(())
+    }
 }
 
 fn initialize_connection(connection: &Connection) -> Result<()> {
@@ -209,7 +320,16 @@ fn initialize_connection(connection: &Connection) -> Result<()> {
                  PRIMARY KEY (platform, post_id, variant)
              );
              CREATE INDEX IF NOT EXISTS telegram_media_cache_last_used_idx
-                 ON telegram_media_cache(last_used_at);",
+                 ON telegram_media_cache(last_used_at);
+             CREATE TABLE IF NOT EXISTS telegram_user_settings (
+                 user_id INTEGER PRIMARY KEY,
+                 language TEXT NOT NULL,
+                 show_source INTEGER NOT NULL CHECK (show_source IN (0, 1)),
+                 show_progress INTEGER NOT NULL CHECK (show_progress IN (0, 1)),
+                 reply_to_source INTEGER NOT NULL DEFAULT 1 CHECK (reply_to_source IN (0, 1)),
+                 show_video_cover INTEGER NOT NULL DEFAULT 1 CHECK (show_video_cover IN (0, 1)),
+                 updated_at TEXT NOT NULL
+             );",
         )
         .map_err(db_error)?;
 
@@ -244,7 +364,7 @@ fn initialize_connection(connection: &Connection) -> Result<()> {
             )
             .map_err(db_error)?;
     }
-    if schema_version < CACHE_SCHEMA_VERSION {
+    if schema_version < 5 {
         // Version 5 renames the remaining single-video cache key. Drop any
         // pre-release rows already using the new key before moving the trusted
         // version-4 rows, so the migration cannot hit a primary-key conflict.
@@ -269,11 +389,49 @@ fn initialize_connection(connection: &Connection) -> Result<()> {
             )
             .map_err(db_error)?;
         transaction
+            .pragma_update(None, "user_version", 5)
+            .map_err(db_error)?;
+    }
+    if schema_version < CACHE_SCHEMA_VERSION {
+        ensure_user_settings_column(
+            &transaction,
+            "reply_to_source",
+            "reply_to_source INTEGER NOT NULL DEFAULT 1 CHECK (reply_to_source IN (0, 1))",
+        )?;
+        ensure_user_settings_column(
+            &transaction,
+            "show_video_cover",
+            "show_video_cover INTEGER NOT NULL DEFAULT 1 CHECK (show_video_cover IN (0, 1))",
+        )?;
+        transaction
             .pragma_update(None, "user_version", CACHE_SCHEMA_VERSION)
             .map_err(db_error)?;
     }
     prune_cache(&transaction, CACHE_MAX_ENTRIES, CACHE_MAX_AGE_DAYS)?;
     transaction.commit().map_err(db_error)?;
+    Ok(())
+}
+
+fn ensure_user_settings_column(
+    transaction: &Transaction<'_>,
+    column_name: &str,
+    definition: &str,
+) -> Result<()> {
+    let exists = transaction
+        .prepare("SELECT 1 FROM pragma_table_info('telegram_user_settings') WHERE name = ?1")
+        .map_err(db_error)?
+        .query_row(params![column_name], |_| Ok(()))
+        .optional()
+        .map_err(db_error)?
+        .is_some();
+    if !exists {
+        transaction
+            .execute(
+                &format!("ALTER TABLE telegram_user_settings ADD COLUMN {definition}"),
+                [],
+            )
+            .map_err(db_error)?;
+    }
     Ok(())
 }
 
@@ -474,6 +632,46 @@ mod tests {
                 .is_none()
         );
         assert!(cached_post_ids(&cache.connection.lock()).is_empty());
+    }
+
+    #[tokio::test]
+    async fn user_settings_default_and_round_trip() {
+        let connection = Connection::open_in_memory().unwrap();
+        initialize_connection(&connection).unwrap();
+        let cache = MediaCache {
+            connection: Arc::new(Mutex::new(connection)),
+        };
+
+        assert_eq!(
+            cache
+                .get_user_settings_with_default(42, Language::Chinese)
+                .await
+                .unwrap(),
+            UserSettings::default()
+        );
+        assert_eq!(
+            cache
+                .get_user_settings_with_default(43, Language::Russian)
+                .await
+                .unwrap()
+                .language,
+            Language::Russian
+        );
+        let settings = UserSettings {
+            language: Language::Japanese,
+            show_source: false,
+            show_progress: true,
+            reply_to_source: false,
+            show_video_cover: true,
+        };
+        cache.put_user_settings(42, settings).await.unwrap();
+        assert_eq!(
+            cache
+                .get_user_settings_with_default(42, Language::Chinese)
+                .await
+                .unwrap(),
+            settings
+        );
     }
 
     #[test]
