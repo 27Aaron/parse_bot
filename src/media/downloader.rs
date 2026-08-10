@@ -1,6 +1,7 @@
 use std::{
     collections::{HashMap, HashSet},
     fs::{File, OpenOptions},
+    future::Future,
     io::Write,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     path::{Path, PathBuf},
@@ -20,6 +21,7 @@ use reqwest::{
     redirect::Policy,
 };
 use tokio::{sync::mpsc, time::timeout};
+use tracing::warn;
 use url::{Host, Url};
 use uuid::Uuid;
 
@@ -37,6 +39,7 @@ const CHANNELS_REFERER: &str = "https://channels.weixin.qq.com/";
 const MEDIA_USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
      (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36";
 const PROGRESS_THRESHOLDS: [u8; 5] = [20, 40, 60, 80, 100];
+const DOWNLOAD_RETRY_DELAYS: [Duration; 2] = [Duration::from_secs(1), Duration::from_secs(2)];
 
 /// Progress reported after source bytes have actually been written to disk.
 ///
@@ -210,7 +213,10 @@ impl MediaDownloader {
     ) -> Result<DownloadedMedia> {
         timeout(
             self.request_timeout,
-            self.download_url_within_deadline(url, size_hint, progress_callback),
+            retry_transient_downloads(
+                || self.download_url_within_deadline(url, size_hint, progress_callback.clone()),
+                &DOWNLOAD_RETRY_DELAYS,
+            ),
         )
         .await
         .map_err(|_| AppError::Download("媒体下载总超时".to_owned()))?
@@ -381,7 +387,7 @@ impl MediaDownloader {
         if let Some(expected) = content_length
             && disk_bytes != expected
         {
-            return Err(AppError::Download(
+            return Err(AppError::Network(
                 "媒体文件大小与 Content-Length 不一致".to_owned(),
             ));
         }
@@ -396,6 +402,42 @@ impl MediaDownloader {
 
         Ok(media)
     }
+}
+
+async fn retry_transient_downloads<T, F, Fut>(
+    mut operation: F,
+    retry_delays: &[Duration],
+) -> Result<T>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<T>>,
+{
+    let max_attempts = retry_delays.len() + 1;
+    for attempt in 1..=max_attempts {
+        match operation().await {
+            Ok(value) => return Ok(value),
+            Err(error) if is_transient_download_error(&error) && attempt < max_attempts => {
+                let delay = retry_delays[attempt - 1];
+                warn!(
+                    event = "media_download_retry",
+                    attempt,
+                    max_attempts,
+                    ?delay,
+                    error = %error,
+                    "媒体下载遇到临时错误，准备重试"
+                );
+                tokio::time::sleep(delay).await;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    unreachable!("the download retry loop always returns on its final attempt")
+}
+
+fn is_transient_download_error(error: &AppError) -> bool {
+    // A 429 may carry a server-specific Retry-After value that AppError does
+    // not preserve. Surface it instead of guessing a delay and adding load.
+    matches!(error, AppError::Network(_))
 }
 
 fn pinned_http_client(
@@ -443,12 +485,12 @@ fn validate_media_url<'a>(url: &'a Url, allowed_hosts: &HashSet<String>) -> Resu
 async fn resolve_public_addresses(host: &str) -> Result<Vec<SocketAddr>> {
     let addresses = timeout(DNS_TIMEOUT, tokio::net::lookup_host((host, 443)))
         .await
-        .map_err(|_| AppError::Download("媒体主机 DNS 解析超时".to_owned()))?
-        .map_err(|_| AppError::Download("媒体主机 DNS 解析失败".to_owned()))?
+        .map_err(|_| AppError::Network("媒体主机 DNS 解析超时".to_owned()))?
+        .map_err(|_| AppError::Network("媒体主机 DNS 解析失败".to_owned()))?
         .collect::<Vec<_>>();
 
     if addresses.is_empty() {
-        return Err(AppError::Download("媒体主机没有可用 DNS 地址".to_owned()));
+        return Err(AppError::Network("媒体主机没有可用 DNS 地址".to_owned()));
     }
     if addresses
         .iter()
@@ -512,6 +554,14 @@ fn check_response_status(status: StatusCode) -> Result<()> {
         StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => Err(AppError::Expired),
         StatusCode::NOT_FOUND | StatusCode::GONE => Err(AppError::NotFound),
         StatusCode::TOO_MANY_REQUESTS => Err(AppError::RateLimited),
+        StatusCode::REQUEST_TIMEOUT | StatusCode::TOO_EARLY => Err(AppError::Network(format!(
+            "媒体服务器暂时不可用（HTTP {}）",
+            status.as_u16()
+        ))),
+        status if status.is_server_error() => Err(AppError::Network(format!(
+            "媒体服务器暂时不可用（HTTP {}）",
+            status.as_u16()
+        ))),
         status => Err(AppError::Download(format!(
             "媒体服务器返回 HTTP {}",
             status.as_u16()
@@ -548,10 +598,10 @@ fn reject_encoded_response(response: &Response) -> Result<()> {
 
 fn map_reqwest_download_error(error: reqwest::Error) -> AppError {
     if error.is_timeout() {
-        AppError::Download("媒体请求超时".to_owned())
+        AppError::Network("媒体请求超时".to_owned())
     } else {
         // Do not format `error`: reqwest errors may include the signed URL.
-        AppError::Download("媒体网络请求失败".to_owned())
+        AppError::Network("媒体网络请求失败".to_owned())
     }
 }
 
@@ -745,7 +795,7 @@ fn valid_host_name(host: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Mutex;
+    use std::sync::{Mutex, atomic::AtomicUsize};
 
     use super::*;
 
@@ -754,6 +804,98 @@ mod tests {
             .iter()
             .map(|host| (*host).to_owned())
             .collect()
+    }
+
+    #[tokio::test]
+    async fn retries_only_transient_download_failures() {
+        let transient_attempts = AtomicUsize::new(0);
+        let value = retry_transient_downloads(
+            || {
+                let attempt = transient_attempts.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    if attempt < 2 {
+                        Err(AppError::Network("temporary".into()))
+                    } else {
+                        Ok(42_u8)
+                    }
+                }
+            },
+            &[Duration::ZERO, Duration::ZERO],
+        )
+        .await
+        .unwrap();
+        assert_eq!(value, 42);
+        assert_eq!(transient_attempts.load(Ordering::SeqCst), 3);
+
+        let permanent_attempts = AtomicUsize::new(0);
+        let error = retry_transient_downloads(
+            || {
+                permanent_attempts.fetch_add(1, Ordering::SeqCst);
+                async { Err::<(), _>(AppError::NotFound) }
+            },
+            &[Duration::ZERO, Duration::ZERO],
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, AppError::NotFound));
+        assert_eq!(permanent_attempts.load(Ordering::SeqCst), 1);
+
+        let rate_limited_attempts = AtomicUsize::new(0);
+        let error = retry_transient_downloads(
+            || {
+                rate_limited_attempts.fetch_add(1, Ordering::SeqCst);
+                async { Err::<(), _>(AppError::RateLimited) }
+            },
+            &[Duration::ZERO, Duration::ZERO],
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, AppError::RateLimited));
+        assert_eq!(rate_limited_attempts.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_retry_backoff_returns_immediately() {
+        let attempts = AtomicUsize::new(0);
+        let retry_delays = [Duration::from_secs(60)];
+        let retrying = retry_transient_downloads(
+            || {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                async { Err::<(), _>(AppError::Network("temporary".into())) }
+            },
+            &retry_delays,
+        );
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), retrying)
+                .await
+                .is_err()
+        );
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn classifies_only_temporary_http_statuses_for_retry() {
+        assert!(matches!(
+            check_response_status(StatusCode::INTERNAL_SERVER_ERROR),
+            Err(AppError::Network(_))
+        ));
+        assert!(matches!(
+            check_response_status(StatusCode::REQUEST_TIMEOUT),
+            Err(AppError::Network(_))
+        ));
+        assert!(matches!(
+            check_response_status(StatusCode::TOO_MANY_REQUESTS),
+            Err(AppError::RateLimited)
+        ));
+        assert!(matches!(
+            check_response_status(StatusCode::NOT_FOUND),
+            Err(AppError::NotFound)
+        ));
+        assert!(matches!(
+            check_response_status(StatusCode::BAD_REQUEST),
+            Err(AppError::Download(_))
+        ));
     }
 
     #[test]
