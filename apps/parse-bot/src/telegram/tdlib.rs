@@ -37,7 +37,7 @@ use tokio_util::task::TaskTracker;
 use tracing::{info, warn};
 use uuid::Uuid;
 
-use crate::media::{DownloadedMedia, MediaDownloader};
+use parse_core::media::{DownloadedMedia, MediaDownloader};
 
 use super::api::{
     BotCommand, CallbackQuery, Chat, ChatKind, ChatMember, ChatMemberStatus, Document,

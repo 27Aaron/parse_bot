@@ -16,17 +16,23 @@ use tokio::{
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
 use tracing::{Instrument, error, info, info_span, warn};
 
+use parse_core::{
+    ParseHub, ResolvedPost,
+    media::{DownloadedMedia, MediaDownloader, MediaProbe, decrypt_file_prefix, probe_media},
+    model::{MediaSource, VideoCodec},
+};
+
 use crate::{
     AppError, Result,
     i18n::{self, Language, Status},
-    media::{DownloadedMedia, MediaDownloader, MediaProbe, decrypt_file_prefix, probe_media},
-    model::{MediaSource, ResolvedPost, TelegramMediaKind, VideoCodec},
     storage::{CachedTelegramMedia, MediaCache, UserSettings},
-    telegram::api::{
-        BotCommand, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, InputFile, Message,
-        TelegramClient, TelegramError, Update, VideoMetadata, escape_html,
+    telegram::{
+        TelegramMediaKind,
+        api::{
+            BotCommand, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, InputFile,
+            Message, TelegramClient, TelegramError, Update, VideoMetadata, escape_html,
+        },
     },
-    wechat::{WechatResolver, extract_share_url},
 };
 
 use super::TELEGRAM_FILE_LIMIT_BYTES;
@@ -278,7 +284,7 @@ fn safe_callback_action(data: &str) -> Option<&'static str> {
 #[derive(Clone)]
 pub struct BotService {
     telegram: TelegramClient,
-    resolver: WechatResolver,
+    resolver: ParseHub,
     downloader: MediaDownloader,
     cache: MediaCache,
     required_channel_id: Option<Arc<str>>,
@@ -572,7 +578,7 @@ enum QueueAction {
 impl BotService {
     pub fn new(
         telegram: TelegramClient,
-        resolver: WechatResolver,
+        resolver: ParseHub,
         downloader: MediaDownloader,
         cache: MediaCache,
         required_channel_id: Option<String>,
@@ -1106,9 +1112,10 @@ impl BotService {
         preferences: UserSettings,
         shutdown: &CancellationToken,
     ) -> Result<()> {
-        let share_url = match extract_share_url(&input) {
+        let share_url = match ParseHub::extract_share_url(&input) {
             Ok(url) => url,
             Err(error) => {
+                let error = AppError::from(error);
                 let message = error.localized_message(preferences.language);
                 tokio::select! {
                     _ = shutdown.cancelled() => return Err(AppError::Cancelled),
@@ -1385,7 +1392,7 @@ impl BotService {
 
         let resolved = tokio::select! {
             _ = cancellation.cancelled() => Err(AppError::Cancelled),
-            result = self.resolver.resolve_url(&task.share_url) => result,
+            result = self.resolver.resolve_url(&task.share_url) => result.map_err(AppError::from),
         };
 
         let post = match resolved {
@@ -1731,7 +1738,9 @@ impl BotService {
             .await;
             let refreshed = tokio::select! {
                 _ = cancellation.cancelled() => return Err(AppError::Cancelled),
-                result = self.resolver.resolve_url(&post.canonical_url) => result?,
+                result = self.resolver.resolve_url(&post.canonical_url) => {
+                    result.map_err(AppError::from)?
+                }
             };
             sources = refreshed.media_sources().cloned().collect();
             self.update_status_html(

@@ -1,10 +1,8 @@
 use parse_bot::{
-    AppError, Result,
+    AppError, MediaDownloader, ParseHub, Result,
     config::Config,
-    media::MediaDownloader,
     storage::MediaCache,
     telegram::{BotService, TELEGRAM_FILE_LIMIT_BYTES, TdlibConfig, TelegramClient},
-    wechat::WechatResolver,
 };
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
@@ -28,7 +26,7 @@ async fn main() -> Result<()> {
         );
     }
 
-    let resolver = WechatResolver::new(config.wechat_yuanbao_cookie.clone())?;
+    let resolver = ParseHub::new(config.wechat_yuanbao_cookie.clone())?;
     let downloader =
         MediaDownloader::new(config.data_paths.media.clone(), TELEGRAM_FILE_LIMIT_BYTES)?;
     let cache = MediaCache::open(&config.data_paths.state_database)?;

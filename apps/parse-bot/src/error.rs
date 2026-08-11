@@ -1,7 +1,13 @@
 use std::path::PathBuf;
 
+use parse_core::Error as CoreError;
+
 use crate::i18n::Language;
 
+/// Product-level error used by the Telegram delivery shell.
+///
+/// Core domain failures are mapped from [`parse_core::Error`]. Variants that
+/// only make sense for this bot (Telegram, database, cancellation) stay here.
 #[derive(Debug, thiserror::Error)]
 pub enum AppError {
     #[error("配置错误：{0}")]
@@ -19,7 +25,7 @@ pub enum AppError {
     #[error("该视频暂时无法取得可用媒体地址")]
     MediaUnavailable,
 
-    #[error("微信接口结构可能已经变化")]
+    #[error("上游接口结构可能已经变化")]
     UpstreamChanged,
 
     #[error("上游请求过于频繁，请稍后再试")]
@@ -54,6 +60,27 @@ pub enum AppError {
 
     #[error(transparent)]
     Io(#[from] std::io::Error),
+}
+
+impl From<CoreError> for AppError {
+    fn from(error: CoreError) -> Self {
+        match error {
+            CoreError::Config(message) => Self::Config(message),
+            CoreError::UnsupportedUrl => Self::UnsupportedUrl,
+            CoreError::LoginRequired => Self::LoginRequired,
+            CoreError::NotFound => Self::NotFound,
+            CoreError::MediaUnavailable => Self::MediaUnavailable,
+            CoreError::UpstreamChanged => Self::UpstreamChanged,
+            CoreError::RateLimited => Self::RateLimited,
+            CoreError::Network(message) => Self::Network(message),
+            CoreError::Download(message) => Self::Download(message),
+            CoreError::InvalidMedia(message) => Self::InvalidMedia(message),
+            CoreError::MediaTooLarge { actual, limit } => Self::MediaTooLarge { actual, limit },
+            CoreError::Storage(path) => Self::Storage(path),
+            CoreError::Expired => Self::Expired,
+            CoreError::Io(error) => Self::Io(error),
+        }
+    }
 }
 
 impl AppError {

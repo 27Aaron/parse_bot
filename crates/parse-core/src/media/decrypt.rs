@@ -5,7 +5,7 @@ use tokio::{
     io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt},
 };
 
-use crate::{AppError, Result};
+use crate::{Error, Result};
 
 const ENCRYPTED_PREFIX_BYTES: usize = 128 * 1024;
 
@@ -19,7 +19,7 @@ pub async fn decrypt_file_prefix(path: &Path, decode_key: u64) -> Result<bool> {
         .len()
         .min(ENCRYPTED_PREFIX_BYTES as u64) as usize;
     if length < 8 {
-        return Err(AppError::InvalidMedia("文件短于 MP4 文件头".into()));
+        return Err(Error::InvalidMedia("文件短于 MP4 文件头".into()));
     }
 
     let mut prefix = vec![0_u8; length];
@@ -30,7 +30,7 @@ pub async fn decrypt_file_prefix(path: &Path, decode_key: u64) -> Result<bool> {
 
     xor_keystream(&mut prefix, decode_key);
     if !looks_like_bmff(&prefix) {
-        return Err(AppError::InvalidMedia(
+        return Err(Error::InvalidMedia(
             "decodeKey 与媒体不匹配，解密后没有有效 BMFF 文件头".into(),
         ));
     }

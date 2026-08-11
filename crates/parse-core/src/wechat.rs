@@ -14,7 +14,7 @@ use url::Url;
 use uuid::Uuid;
 
 use crate::{
-    AppError, Result,
+    Error, Result,
     model::{MediaSource, MediaSourceKind, REVIEWED_WECHAT_MEDIA_HOSTS, ResolvedPost, VideoCodec},
 };
 
@@ -67,13 +67,11 @@ impl WechatResolver {
         let timeout = RESOLVE_TIMEOUT;
         let cookie = cookie.into();
         if cookie.trim().is_empty() {
-            return Err(AppError::Config("WECHAT_YUANBAO_COOKIE 不能为空".into()));
+            return Err(Error::Config("WECHAT_YUANBAO_COOKIE 不能为空".into()));
         }
         for endpoint in [&parse_endpoint, &feed_endpoint] {
             if endpoint.scheme() != "https" && !endpoint_is_loopback_http(endpoint) {
-                return Err(AppError::Config(
-                    "视频号解析 endpoint 必须使用 HTTPS".into(),
-                ));
+                return Err(Error::Config("视频号解析 endpoint 必须使用 HTTPS".into()));
             }
         }
 
@@ -83,7 +81,7 @@ impl WechatResolver {
             .redirect(Policy::none())
             .no_proxy()
             .build()
-            .map_err(|_| AppError::Config("无法初始化视频号 HTTP 客户端".into()))?;
+            .map_err(|_| Error::Config("无法初始化视频号 HTTP 客户端".into()))?;
 
         Ok(Self {
             client,
@@ -99,24 +97,24 @@ impl WechatResolver {
         let normalized = normalize_share_url(&url)?;
         tokio::time::timeout(self.timeout, self.resolve_normalized(normalized))
             .await
-            .map_err(|_| AppError::Network("视频号解析总超时".into()))?
+            .map_err(|_| Error::Network("视频号解析总超时".into()))?
     }
 
     pub async fn resolve_url(&self, url: &Url) -> Result<ResolvedPost> {
         let normalized = normalize_share_url(url)?;
         tokio::time::timeout(self.timeout, self.resolve_normalized(normalized))
             .await
-            .map_err(|_| AppError::Network("视频号解析总超时".into()))?
+            .map_err(|_| Error::Network("视频号解析总超时".into()))?
     }
 
     async fn resolve_normalized(&self, normalized: NormalizedShareUrl) -> Result<ResolvedPost> {
         let parse_data = self.request_parse(&normalized.canonical_url).await?;
         let playable_url =
-            Url::parse(parse_data.playable_url.trim()).map_err(|_| AppError::UpstreamChanged)?;
-        let general_token = query_value(&playable_url, "token").ok_or(AppError::UpstreamChanged)?;
+            Url::parse(parse_data.playable_url.trim()).map_err(|_| Error::UpstreamChanged)?;
+        let general_token = query_value(&playable_url, "token").ok_or(Error::UpstreamChanged)?;
         let export_id = query_value(&playable_url, "eid")
             .or_else(|| non_empty(parse_data.wx_export_id.clone()))
-            .ok_or(AppError::UpstreamChanged)?;
+            .ok_or(Error::UpstreamChanged)?;
 
         let feed = self.request_feed(&export_id, &general_token).await?;
         build_post(normalized, parse_data, feed, export_id)
@@ -177,20 +175,20 @@ impl WechatResolver {
         let code = value.get("code").and_then(Value::as_i64).unwrap_or(0);
         if code != 0 {
             return if response_looks_like_login(&value) {
-                Err(AppError::LoginRequired)
+                Err(Error::LoginRequired)
             } else {
-                Err(AppError::UpstreamChanged)
+                Err(Error::UpstreamChanged)
             };
         }
 
         let data = value.get("data").cloned().ok_or_else(|| {
             if response_looks_like_login(&value) {
-                AppError::LoginRequired
+                Error::LoginRequired
             } else {
-                AppError::UpstreamChanged
+                Error::UpstreamChanged
             }
         })?;
-        serde_json::from_value::<ParseData>(data).map_err(|_| AppError::UpstreamChanged)
+        serde_json::from_value::<ParseData>(data).map_err(|_| Error::UpstreamChanged)
     }
 
     async fn request_feed(&self, export_id: &str, general_token: &str) -> Result<Value> {
@@ -251,11 +249,11 @@ impl WechatResolver {
             .unwrap_or(0);
         if err_code != 0 {
             return if response_looks_like_login(&value) {
-                Err(AppError::LoginRequired)
+                Err(Error::LoginRequired)
             } else if value_to_text(value.get("errMsg")).contains("不存在") {
-                Err(AppError::NotFound)
+                Err(Error::NotFound)
             } else {
-                Err(AppError::UpstreamChanged)
+                Err(Error::UpstreamChanged)
             };
         }
         Ok(value)
@@ -286,7 +284,7 @@ pub fn extract_share_url(input: &str) -> Result<Url> {
             return Ok(normalized.canonical_url);
         }
     }
-    Err(AppError::UnsupportedUrl)
+    Err(Error::UnsupportedUrl)
 }
 
 fn normalize_share_url(url: &Url) -> Result<NormalizedShareUrl> {
@@ -297,23 +295,23 @@ fn normalize_share_url(url: &Url) -> Result<NormalizedShareUrl> {
         || url.query().is_some()
         || url.fragment().is_some()
     {
-        return Err(AppError::UnsupportedUrl);
+        return Err(Error::UnsupportedUrl);
     }
 
-    let host = url.host_str().ok_or(AppError::UnsupportedUrl)?;
+    let host = url.host_str().ok_or(Error::UnsupportedUrl)?;
     if host.ends_with('.') {
-        return Err(AppError::UnsupportedUrl);
+        return Err(Error::UnsupportedUrl);
     }
     let host = host.to_ascii_lowercase();
 
     if host != "weixin.qq.com" {
-        return Err(AppError::UnsupportedUrl);
+        return Err(Error::UnsupportedUrl);
     }
     let share_id = url
         .path()
         .strip_prefix("/sph/")
         .filter(|value| !value.is_empty() && !value.contains('/'))
-        .ok_or(AppError::UnsupportedUrl)?
+        .ok_or(Error::UnsupportedUrl)?
         .to_owned();
 
     if !(6..=128).contains(&share_id.len())
@@ -321,7 +319,7 @@ fn normalize_share_url(url: &Url) -> Result<NormalizedShareUrl> {
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
     {
-        return Err(AppError::UnsupportedUrl);
+        return Err(Error::UnsupportedUrl);
     }
 
     let canonical_url = Url::parse(&format!("https://weixin.qq.com/sph/{share_id}"))
@@ -367,9 +365,9 @@ fn build_post(
                     value.get("data")
                 }
             })
-            .ok_or(AppError::UpstreamChanged)?
+            .ok_or(Error::UpstreamChanged)?
     };
-    let feed_info = data.get("feedInfo").ok_or(AppError::UpstreamChanged)?;
+    let feed_info = data.get("feedInfo").ok_or(Error::UpstreamChanged)?;
 
     let mut candidates = Vec::new();
     push_candidate(
@@ -442,7 +440,7 @@ fn build_post(
         (direct_source, fallback_videos)
     } else {
         if derived_sources.is_empty() {
-            return Err(AppError::MediaUnavailable);
+            return Err(Error::MediaUnavailable);
         }
         let video = derived_sources.remove(0);
         (video, derived_sources)
@@ -675,23 +673,20 @@ fn response_looks_like_login(value: &Value) -> bool {
 fn map_status(status: StatusCode, yuanbao: bool) -> Result<()> {
     match status {
         status if status.is_success() => Ok(()),
-        StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN if yuanbao => Err(AppError::LoginRequired),
-        StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => Err(AppError::NotFound),
-        StatusCode::NOT_FOUND | StatusCode::GONE => Err(AppError::NotFound),
-        StatusCode::TOO_MANY_REQUESTS => Err(AppError::RateLimited),
-        _ => Err(AppError::Network(format!(
-            "上游返回 HTTP {}",
-            status.as_u16()
-        ))),
+        StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN if yuanbao => Err(Error::LoginRequired),
+        StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => Err(Error::NotFound),
+        StatusCode::NOT_FOUND | StatusCode::GONE => Err(Error::NotFound),
+        StatusCode::TOO_MANY_REQUESTS => Err(Error::RateLimited),
+        _ => Err(Error::Network(format!("上游返回 HTTP {}", status.as_u16()))),
     }
 }
 
-fn map_network_error(error: &reqwest::Error) -> AppError {
+fn map_network_error(error: &reqwest::Error) -> Error {
     if error.is_timeout() {
-        AppError::Network("上游请求超时".into())
+        Error::Network("上游请求超时".into())
     } else {
         // Formatting reqwest::Error can include a signed URL or endpoint.
-        AppError::Network("无法连接上游服务".into())
+        Error::Network("无法连接上游服务".into())
     }
 }
 
@@ -700,7 +695,7 @@ async fn read_json(response: Response) -> Result<Value> {
         .content_length()
         .is_some_and(|length| length > MAX_JSON_BYTES as u64)
     {
-        return Err(AppError::UpstreamChanged);
+        return Err(Error::UpstreamChanged);
     }
     let mut bytes = Vec::new();
     let mut stream = response.bytes_stream();
@@ -710,11 +705,11 @@ async fn read_json(response: Response) -> Result<Value> {
             .len()
             .checked_add(chunk.len())
             .filter(|length| *length <= MAX_JSON_BYTES)
-            .ok_or(AppError::UpstreamChanged)?;
+            .ok_or(Error::UpstreamChanged)?;
         bytes.reserve(next_len.saturating_sub(bytes.len()));
         bytes.extend_from_slice(&chunk);
     }
-    serde_json::from_slice(&bytes).map_err(|_| AppError::UpstreamChanged)
+    serde_json::from_slice(&bytes).map_err(|_| Error::UpstreamChanged)
 }
 
 #[derive(Serialize)]
@@ -770,7 +765,7 @@ mod tests {
         ] {
             assert!(matches!(
                 extract_share_url(input),
-                Err(AppError::UnsupportedUrl)
+                Err(Error::UnsupportedUrl)
             ));
         }
     }
@@ -1129,7 +1124,7 @@ mod tests {
         });
 
         let error = build_post(normalized, parse_data, feed, "export-id".to_owned()).unwrap_err();
-        assert!(matches!(error, AppError::MediaUnavailable));
+        assert!(matches!(error, Error::MediaUnavailable));
     }
 
     #[test]

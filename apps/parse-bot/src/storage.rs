@@ -4,7 +4,7 @@ use chrono::{TimeDelta, Utc};
 use parking_lot::Mutex;
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 
-use crate::{AppError, Result, i18n::Language, model::TelegramMediaKind};
+use crate::{AppError, Result, i18n::Language, telegram::TelegramMediaKind};
 
 const CACHE_SCHEMA_VERSION: i64 = 7;
 const VIDEO_VARIANT: &str = "video";

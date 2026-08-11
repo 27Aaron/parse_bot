@@ -1,9 +1,10 @@
-use std::{fmt, str::FromStr};
+use std::fmt;
 
 use serde::{Deserialize, Serialize};
 use url::Url;
 
-pub(crate) const REVIEWED_WECHAT_MEDIA_HOSTS: &[&str] = &[
+/// Reviewed WeChat Channels CDN hosts allowed for media download.
+pub const REVIEWED_WECHAT_MEDIA_HOSTS: &[&str] = &[
     "finder.video.qq.com",
     "findermp.video.qq.com",
     "finder.video.wechat.com",
@@ -55,6 +56,7 @@ impl fmt::Debug for MediaSource {
     }
 }
 
+/// Platform-agnostic resolved post ready for download / delivery.
 #[derive(Clone)]
 pub struct ResolvedPost {
     pub platform: String,
@@ -90,36 +92,17 @@ impl ResolvedPost {
         self.title
             .as_deref()
             .filter(|value| !value.trim().is_empty())
-            .unwrap_or("微信视频号视频")
+            .unwrap_or(default_title_for_platform(&self.platform))
             .chars()
             .take(180)
             .collect()
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TelegramMediaKind {
-    Video,
-    Document,
-}
-
-impl TelegramMediaKind {
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Video => "video",
-            Self::Document => "document",
-        }
-    }
-}
-
-impl FromStr for TelegramMediaKind {
-    type Err = ();
-
-    fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
-        match value {
-            "video" => Ok(Self::Video),
-            "document" => Ok(Self::Document),
-            _ => Err(()),
-        }
+fn default_title_for_platform(platform: &str) -> &'static str {
+    match platform {
+        "wechat_channels" => "微信视频号视频",
+        // Future platforms can add their own fallback titles here.
+        _ => "视频",
     }
 }
