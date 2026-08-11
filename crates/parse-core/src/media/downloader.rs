@@ -26,7 +26,7 @@ use url::{Host, Url};
 use uuid::Uuid;
 
 use crate::{
-    error::{AppError, Result},
+    error::{Error, Result},
     model::{MediaSource, REVIEWED_WECHAT_MEDIA_HOSTS},
 };
 
@@ -76,7 +76,7 @@ impl DownloadedMedia {
         match tokio::fs::remove_file(&self.path).await {
             Ok(()) => Ok(()),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(AppError::Io(error)),
+            Err(error) => Err(Error::Io(error)),
         }
     }
 }
@@ -109,7 +109,7 @@ impl MediaDownloader {
     /// Construct a downloader using the reviewed WeChat media CDN allowlist.
     pub fn new(workspace_dir: impl Into<PathBuf>, max_bytes: u64) -> Result<Self> {
         if max_bytes == 0 {
-            return Err(AppError::Config("媒体下载大小上限必须大于零".to_owned()));
+            return Err(Error::Config("媒体下载大小上限必须大于零".to_owned()));
         }
 
         let allowed_hosts = REVIEWED_WECHAT_MEDIA_HOSTS
@@ -127,17 +127,17 @@ impl MediaDownloader {
         request_timeout: Duration,
     ) -> Result<Self> {
         if max_bytes == 0 {
-            return Err(AppError::Config("媒体下载大小上限必须大于零".to_owned()));
+            return Err(Error::Config("媒体下载大小上限必须大于零".to_owned()));
         }
         if request_timeout.is_zero() {
-            return Err(AppError::Config("媒体下载超时必须大于零".to_owned()));
+            return Err(Error::Config("媒体下载超时必须大于零".to_owned()));
         }
         let allowed_hosts = allowed_hosts
             .into_iter()
             .map(|host| host.to_ascii_lowercase())
             .collect::<HashSet<_>>();
         if allowed_hosts.is_empty() || allowed_hosts.iter().any(|host| !valid_host_name(host)) {
-            return Err(AppError::Config("媒体主机允许列表无效".to_owned()));
+            return Err(Error::Config("媒体主机允许列表无效".to_owned()));
         }
 
         Ok(Self {
@@ -155,9 +155,9 @@ impl MediaDownloader {
     /// This is intended for callers that need to fetch a smaller auxiliary
     /// asset without constructing a second HTTP client policy. Asking for a
     /// larger limit never weakens the original downloader's cap.
-    pub(crate) fn capped(&self, max_bytes: u64) -> Result<Self> {
+    pub fn capped(&self, max_bytes: u64) -> Result<Self> {
         if max_bytes == 0 {
-            return Err(AppError::Config("媒体下载大小上限必须大于零".to_owned()));
+            return Err(Error::Config("媒体下载大小上限必须大于零".to_owned()));
         }
 
         Ok(Self {
@@ -170,13 +170,9 @@ impl MediaDownloader {
     }
 
     /// Return a downloader with stricter byte and request-duration limits.
-    pub(crate) fn capped_with_timeout(
-        &self,
-        max_bytes: u64,
-        request_timeout: Duration,
-    ) -> Result<Self> {
+    pub fn capped_with_timeout(&self, max_bytes: u64, request_timeout: Duration) -> Result<Self> {
         if request_timeout.is_zero() {
-            return Err(AppError::Config("媒体下载超时必须大于零".to_owned()));
+            return Err(Error::Config("媒体下载超时必须大于零".to_owned()));
         }
         let mut downloader = self.capped(max_bytes)?;
         downloader.request_timeout = downloader.request_timeout.min(request_timeout);
@@ -194,7 +190,7 @@ impl MediaDownloader {
     ///
     /// The request still passes through the downloader's host allowlist, DNS
     /// pinning, redirect validation, timeout, and streaming byte limit.
-    pub(crate) async fn download_url(&self, url: &Url) -> Result<DownloadedMedia> {
+    pub async fn download_url(&self, url: &Url) -> Result<DownloadedMedia> {
         self.download_url_with_callback(url, None, None).await
     }
 
@@ -230,7 +226,7 @@ impl MediaDownloader {
             ),
         )
         .await
-        .map_err(|_| AppError::Download("媒体下载总超时".to_owned()))?
+        .map_err(|_| Error::Download("媒体下载总超时".to_owned()))?
     }
 
     async fn download_url_within_deadline(
@@ -240,7 +236,7 @@ impl MediaDownloader {
         progress_callback: Option<ProgressCallback>,
     ) -> Result<DownloadedMedia> {
         if let Some(actual) = size_hint.filter(|size| *size > self.max_bytes) {
-            return Err(AppError::MediaTooLarge {
+            return Err(Error::MediaTooLarge {
                 actual,
                 limit: self.max_bytes,
             });
@@ -252,7 +248,7 @@ impl MediaDownloader {
 
         let content_length = checked_content_length(&response)?;
         if let Some(actual) = content_length.filter(|actual| *actual > self.max_bytes) {
-            return Err(AppError::MediaTooLarge {
+            return Err(Error::MediaTooLarge {
                 actual,
                 limit: self.max_bytes,
             });
@@ -275,7 +271,7 @@ impl MediaDownloader {
             }
             let client = pinned_clients
                 .get(&host)
-                .ok_or_else(|| AppError::Download("媒体 HTTP 客户端初始化失败".to_owned()))?;
+                .ok_or_else(|| Error::Download("媒体 HTTP 客户端初始化失败".to_owned()))?;
 
             let response = self.request_with_client(client, &current).await?;
 
@@ -284,22 +280,22 @@ impl MediaDownloader {
             }
 
             if redirect_count == MAX_REDIRECTS {
-                return Err(AppError::Download("媒体重定向次数过多".to_owned()));
+                return Err(Error::Download("媒体重定向次数过多".to_owned()));
             }
 
             let location = response
                 .headers()
                 .get(LOCATION)
-                .ok_or_else(|| AppError::Download("媒体重定向缺少 Location".to_owned()))?
+                .ok_or_else(|| Error::Download("媒体重定向缺少 Location".to_owned()))?
                 .to_str()
-                .map_err(|_| AppError::Download("媒体重定向地址无效".to_owned()))?;
+                .map_err(|_| Error::Download("媒体重定向地址无效".to_owned()))?;
 
             current = current
                 .join(location)
-                .map_err(|_| AppError::Download("媒体重定向地址无效".to_owned()))?;
+                .map_err(|_| Error::Download("媒体重定向地址无效".to_owned()))?;
         }
 
-        Err(AppError::Download("媒体重定向次数过多".to_owned()))
+        Err(Error::Download("媒体重定向次数过多".to_owned()))
     }
 
     async fn request_with_client(&self, client: &Client, url: &Url) -> Result<Response> {
@@ -323,7 +319,7 @@ impl MediaDownloader {
     ) -> Result<DownloadedMedia> {
         tokio::fs::create_dir_all(self.workspace_dir.as_path())
             .await
-            .map_err(|_| AppError::Storage(self.workspace_dir.as_ref().clone()))?;
+            .map_err(|_| Error::Storage(self.workspace_dir.as_ref().clone()))?;
         let path = random_task_path(self.workspace_dir.as_path());
         let pending_file = create_private_file(path.clone()).await?;
         let (sender, mut receiver) = mpsc::channel(4);
@@ -347,20 +343,21 @@ impl MediaDownloader {
             loop {
                 let chunk = timeout(DOWNLOAD_IDLE_TIMEOUT, response.chunk())
                     .await
-                    .map_err(|_| AppError::Network("媒体响应读取超时".to_owned()))?
+                    .map_err(|_| Error::Network("媒体响应读取超时".to_owned()))?
                     .map_err(map_reqwest_download_error)?;
                 let Some(chunk) = chunk else {
                     break;
                 };
-                streamed_bytes = streamed_bytes.checked_add(chunk.len() as u64).ok_or(
-                    AppError::MediaTooLarge {
-                        actual: u64::MAX,
-                        limit: self.max_bytes,
-                    },
-                )?;
+                streamed_bytes =
+                    streamed_bytes
+                        .checked_add(chunk.len() as u64)
+                        .ok_or(Error::MediaTooLarge {
+                            actual: u64::MAX,
+                            limit: self.max_bytes,
+                        })?;
 
                 if streamed_bytes > self.max_bytes {
-                    return Err(AppError::MediaTooLarge {
+                    return Err(Error::MediaTooLarge {
                         actual: streamed_bytes,
                         limit: self.max_bytes,
                     });
@@ -369,7 +366,7 @@ impl MediaDownloader {
                 sender
                     .send(chunk)
                     .await
-                    .map_err(|_| AppError::Download("媒体文件写入失败".to_owned()))?;
+                    .map_err(|_| Error::Download("媒体文件写入失败".to_owned()))?;
             }
             Ok(())
         }
@@ -380,7 +377,7 @@ impl MediaDownloader {
             Ok(result) => result,
             Err(_) => {
                 let _ = tokio::fs::remove_file(&path).await;
-                return Err(AppError::Download("媒体文件写入任务失败".to_owned()));
+                return Err(Error::Download("媒体文件写入任务失败".to_owned()));
             }
         };
 
@@ -390,28 +387,28 @@ impl MediaDownloader {
         };
 
         if outcome.media.bytes != streamed_bytes {
-            return Err(AppError::Download("媒体文件写入不完整".to_owned()));
+            return Err(Error::Download("媒体文件写入不完整".to_owned()));
         }
 
         let disk_bytes = match tokio::fs::metadata(&outcome.media.path).await {
             Ok(metadata) => metadata.len(),
-            Err(_) => return Err(AppError::Storage(self.workspace_dir.as_ref().clone())),
+            Err(_) => return Err(Error::Storage(self.workspace_dir.as_ref().clone())),
         };
 
         if disk_bytes > self.max_bytes {
-            return Err(AppError::MediaTooLarge {
+            return Err(Error::MediaTooLarge {
                 actual: disk_bytes,
                 limit: self.max_bytes,
             });
         }
         if disk_bytes != outcome.media.bytes {
-            return Err(AppError::Download("媒体文件落盘大小不一致".to_owned()));
+            return Err(Error::Download("媒体文件落盘大小不一致".to_owned()));
         }
 
         if let Some(expected) = content_length
             && disk_bytes != expected
         {
-            return Err(AppError::Network(
+            return Err(Error::Network(
                 "媒体文件大小与 Content-Length 不一致".to_owned(),
             ));
         }
@@ -458,10 +455,10 @@ where
     unreachable!("the download retry loop always returns on its final attempt")
 }
 
-fn is_transient_download_error(error: &AppError) -> bool {
-    // A 429 may carry a server-specific Retry-After value that AppError does
+fn is_transient_download_error(error: &Error) -> bool {
+    // A 429 may carry a server-specific Retry-After value that Error does
     // not preserve. Surface it instead of guessing a delay and adding load.
-    matches!(error, AppError::Network(_))
+    matches!(error, Error::Network(_))
 }
 
 fn pinned_http_client(
@@ -477,30 +474,30 @@ fn pinned_http_client(
         .no_proxy()
         .resolve_to_addrs(host, addresses)
         .build()
-        .map_err(|_| AppError::Config("无法初始化媒体 HTTP 客户端".to_owned()))
+        .map_err(|_| Error::Config("无法初始化媒体 HTTP 客户端".to_owned()))
 }
 
 fn validate_media_url<'a>(url: &'a Url, allowed_hosts: &HashSet<String>) -> Result<&'a str> {
     if url.scheme() != "https" {
-        return Err(AppError::Download("媒体地址必须使用 HTTPS".to_owned()));
+        return Err(Error::Download("媒体地址必须使用 HTTPS".to_owned()));
     }
     if !url.username().is_empty() || url.password().is_some() {
-        return Err(AppError::Download("媒体地址不能包含用户凭据".to_owned()));
+        return Err(Error::Download("媒体地址不能包含用户凭据".to_owned()));
     }
     if url.port().is_some_and(|port| port != 443) {
-        return Err(AppError::Download("媒体地址不能使用非标准端口".to_owned()));
+        return Err(Error::Download("媒体地址不能使用非标准端口".to_owned()));
     }
     if url.fragment().is_some() {
-        return Err(AppError::Download("媒体地址不能包含片段标识".to_owned()));
+        return Err(Error::Download("媒体地址不能包含片段标识".to_owned()));
     }
 
     let host = match url.host() {
         Some(Host::Domain(host)) if !host.ends_with('.') => host,
-        _ => return Err(AppError::Download("媒体地址主机无效".to_owned())),
+        _ => return Err(Error::Download("媒体地址主机无效".to_owned())),
     };
     let normalized = host.to_ascii_lowercase();
     if !allowed_hosts.contains(&normalized) {
-        return Err(AppError::Download("媒体地址主机不在允许列表中".to_owned()));
+        return Err(Error::Download("媒体地址主机不在允许列表中".to_owned()));
     }
 
     Ok(host)
@@ -509,18 +506,18 @@ fn validate_media_url<'a>(url: &'a Url, allowed_hosts: &HashSet<String>) -> Resu
 async fn resolve_public_addresses(host: &str) -> Result<Vec<SocketAddr>> {
     let addresses = timeout(DNS_TIMEOUT, tokio::net::lookup_host((host, 443)))
         .await
-        .map_err(|_| AppError::Network("媒体主机 DNS 解析超时".to_owned()))?
-        .map_err(|_| AppError::Network("媒体主机 DNS 解析失败".to_owned()))?
+        .map_err(|_| Error::Network("媒体主机 DNS 解析超时".to_owned()))?
+        .map_err(|_| Error::Network("媒体主机 DNS 解析失败".to_owned()))?
         .collect::<Vec<_>>();
 
     if addresses.is_empty() {
-        return Err(AppError::Network("媒体主机没有可用 DNS 地址".to_owned()));
+        return Err(Error::Network("媒体主机没有可用 DNS 地址".to_owned()));
     }
     if addresses
         .iter()
         .any(|address| is_forbidden_ip(address.ip()))
     {
-        return Err(AppError::Download(
+        return Err(Error::Download(
             "媒体主机解析到了不允许的网络地址".to_owned(),
         ));
     }
@@ -575,18 +572,18 @@ fn is_forbidden_ipv6(ip: Ipv6Addr) -> bool {
 fn check_response_status(status: StatusCode) -> Result<()> {
     match status {
         StatusCode::OK => Ok(()),
-        StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => Err(AppError::Expired),
-        StatusCode::NOT_FOUND | StatusCode::GONE => Err(AppError::NotFound),
-        StatusCode::TOO_MANY_REQUESTS => Err(AppError::RateLimited),
-        StatusCode::REQUEST_TIMEOUT | StatusCode::TOO_EARLY => Err(AppError::Network(format!(
+        StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => Err(Error::Expired),
+        StatusCode::NOT_FOUND | StatusCode::GONE => Err(Error::NotFound),
+        StatusCode::TOO_MANY_REQUESTS => Err(Error::RateLimited),
+        StatusCode::REQUEST_TIMEOUT | StatusCode::TOO_EARLY => Err(Error::Network(format!(
             "媒体服务器暂时不可用（HTTP {}）",
             status.as_u16()
         ))),
-        status if status.is_server_error() => Err(AppError::Network(format!(
+        status if status.is_server_error() => Err(Error::Network(format!(
             "媒体服务器暂时不可用（HTTP {}）",
             status.as_u16()
         ))),
-        status => Err(AppError::Download(format!(
+        status => Err(Error::Download(format!(
             "媒体服务器返回 HTTP {}",
             status.as_u16()
         ))),
@@ -599,10 +596,10 @@ fn checked_content_length(response: &Response) -> Result<Option<u64>> {
     };
     let raw = raw
         .to_str()
-        .map_err(|_| AppError::Download("媒体 Content-Length 无效".to_owned()))?;
+        .map_err(|_| Error::Download("媒体 Content-Length 无效".to_owned()))?;
     let length = raw
         .parse::<u64>()
-        .map_err(|_| AppError::Download("媒体 Content-Length 无效".to_owned()))?;
+        .map_err(|_| Error::Download("媒体 Content-Length 无效".to_owned()))?;
     Ok(Some(length))
 }
 
@@ -610,9 +607,9 @@ fn reject_encoded_response(response: &Response) -> Result<()> {
     if let Some(value) = response.headers().get(CONTENT_ENCODING) {
         let value = value
             .to_str()
-            .map_err(|_| AppError::Download("媒体 Content-Encoding 无效".to_owned()))?;
+            .map_err(|_| Error::Download("媒体 Content-Encoding 无效".to_owned()))?;
         if !value.eq_ignore_ascii_case("identity") {
-            return Err(AppError::Download(
+            return Err(Error::Download(
                 "媒体服务器忽略了 identity 编码要求".to_owned(),
             ));
         }
@@ -620,12 +617,12 @@ fn reject_encoded_response(response: &Response) -> Result<()> {
     Ok(())
 }
 
-fn map_reqwest_download_error(error: reqwest::Error) -> AppError {
+fn map_reqwest_download_error(error: reqwest::Error) -> Error {
     if error.is_timeout() {
-        AppError::Network("媒体请求超时".to_owned())
+        Error::Network("媒体请求超时".to_owned())
     } else {
         // Do not format `error`: reqwest errors may include the signed URL.
-        AppError::Network("媒体网络请求失败".to_owned())
+        Error::Network("媒体网络请求失败".to_owned())
     }
 }
 
@@ -638,12 +635,12 @@ fn ensure_free_disk_space(directory: &Path, pending_write_bytes: u64) -> Result<
     use std::{ffi::CString, mem::MaybeUninit, os::unix::ffi::OsStrExt};
 
     let path = CString::new(directory.as_os_str().as_bytes())
-        .map_err(|_| AppError::Storage(directory.to_owned()))?;
+        .map_err(|_| Error::Storage(directory.to_owned()))?;
     let mut statistics = MaybeUninit::<libc::statvfs>::uninit();
     // SAFETY: `path` is NUL-terminated and `statistics` points to writable,
     // correctly aligned storage. A successful call initializes the structure.
     if unsafe { libc::statvfs(path.as_ptr(), statistics.as_mut_ptr()) } != 0 {
-        return Err(AppError::Storage(directory.to_owned()));
+        return Err(Error::Storage(directory.to_owned()));
     }
     // SAFETY: statvfs returned success immediately above.
     let statistics = unsafe { statistics.assume_init() };
@@ -654,7 +651,7 @@ fn ensure_free_disk_space(directory: &Path, pending_write_bytes: u64) -> Result<
     };
     let available_bytes = u128::from(statistics.f_bavail) * u128::from(block_size);
     if !disk_space_is_sufficient(available_bytes, pending_write_bytes) {
-        return Err(AppError::Storage(directory.to_owned()));
+        return Err(Error::Storage(directory.to_owned()));
     }
     Ok(())
 }
@@ -685,8 +682,8 @@ async fn create_private_file(path: PathBuf) -> Result<PendingFile> {
         options.open(&path).map(|file| PendingFile::new(path, file))
     })
     .await
-    .map_err(|_| AppError::Storage(storage_path.clone()))?
-    .map_err(|_| AppError::Storage(storage_path))
+    .map_err(|_| Error::Storage(storage_path.clone()))?
+    .map_err(|_| Error::Storage(storage_path))
 }
 
 fn write_chunks<T: AsRef<[u8]>>(
@@ -703,12 +700,12 @@ fn write_chunks<T: AsRef<[u8]>>(
         let chunk = chunk.as_ref();
         let next_bytes = bytes
             .checked_add(chunk.len() as u64)
-            .ok_or(AppError::MediaTooLarge {
+            .ok_or(Error::MediaTooLarge {
                 actual: u64::MAX,
                 limit: max_bytes,
             })?;
         if next_bytes > max_bytes {
-            return Err(AppError::MediaTooLarge {
+            return Err(Error::MediaTooLarge {
                 actual: next_bytes,
                 limit: max_bytes,
             });
@@ -727,7 +724,7 @@ fn write_chunks<T: AsRef<[u8]>>(
                 pending_file
                     .path
                     .parent()
-                    .ok_or_else(|| AppError::Storage(pending_file.path.clone()))?,
+                    .ok_or_else(|| Error::Storage(pending_file.path.clone()))?,
                 DISK_CHECK_INTERVAL_BYTES.max(chunk_bytes),
             )?;
             disk_budget.unchecked_bytes = 0;
@@ -848,7 +845,7 @@ impl PendingFile {
     fn file_mut(&mut self) -> Result<&mut File> {
         self.file
             .as_mut()
-            .ok_or_else(|| AppError::Download("临时媒体文件已经关闭".to_owned()))
+            .ok_or_else(|| Error::Download("临时媒体文件已经关闭".to_owned()))
     }
 
     fn finish(mut self, bytes: u64) -> Result<DownloadedMedia> {
@@ -904,7 +901,7 @@ mod tests {
                 let attempt = transient_attempts.fetch_add(1, Ordering::SeqCst);
                 async move {
                     if attempt < 2 {
-                        Err(AppError::Network("temporary".into()))
+                        Err(Error::Network("temporary".into()))
                     } else {
                         Ok(42_u8)
                     }
@@ -921,26 +918,26 @@ mod tests {
         let error = retry_transient_downloads(
             || {
                 permanent_attempts.fetch_add(1, Ordering::SeqCst);
-                async { Err::<(), _>(AppError::NotFound) }
+                async { Err::<(), _>(Error::NotFound) }
             },
             &[Duration::ZERO, Duration::ZERO],
         )
         .await
         .unwrap_err();
-        assert!(matches!(error, AppError::NotFound));
+        assert!(matches!(error, Error::NotFound));
         assert_eq!(permanent_attempts.load(Ordering::SeqCst), 1);
 
         let rate_limited_attempts = AtomicUsize::new(0);
         let error = retry_transient_downloads(
             || {
                 rate_limited_attempts.fetch_add(1, Ordering::SeqCst);
-                async { Err::<(), _>(AppError::RateLimited) }
+                async { Err::<(), _>(Error::RateLimited) }
             },
             &[Duration::ZERO, Duration::ZERO],
         )
         .await
         .unwrap_err();
-        assert!(matches!(error, AppError::RateLimited));
+        assert!(matches!(error, Error::RateLimited));
         assert_eq!(rate_limited_attempts.load(Ordering::SeqCst), 1);
     }
 
@@ -951,7 +948,7 @@ mod tests {
         let retrying = retry_transient_downloads(
             || {
                 attempts.fetch_add(1, Ordering::SeqCst);
-                async { Err::<(), _>(AppError::Network("temporary".into())) }
+                async { Err::<(), _>(Error::Network("temporary".into())) }
             },
             &retry_delays,
         );
@@ -968,23 +965,23 @@ mod tests {
     fn classifies_only_temporary_http_statuses_for_retry() {
         assert!(matches!(
             check_response_status(StatusCode::INTERNAL_SERVER_ERROR),
-            Err(AppError::Network(_))
+            Err(Error::Network(_))
         ));
         assert!(matches!(
             check_response_status(StatusCode::REQUEST_TIMEOUT),
-            Err(AppError::Network(_))
+            Err(Error::Network(_))
         ));
         assert!(matches!(
             check_response_status(StatusCode::TOO_MANY_REQUESTS),
-            Err(AppError::RateLimited)
+            Err(Error::RateLimited)
         ));
         assert!(matches!(
             check_response_status(StatusCode::NOT_FOUND),
-            Err(AppError::NotFound)
+            Err(Error::NotFound)
         ));
         assert!(matches!(
             check_response_status(StatusCode::BAD_REQUEST),
-            Err(AppError::Download(_))
+            Err(Error::Download(_))
         ));
     }
 
@@ -1067,7 +1064,7 @@ mod tests {
         )
         .unwrap();
 
-        assert!(matches!(downloader.capped(0), Err(AppError::Config(_))));
+        assert!(matches!(downloader.capped(0), Err(Error::Config(_))));
     }
 
     #[test]
@@ -1106,7 +1103,7 @@ mod tests {
         let disallowed = Url::parse("https://127.0.0.1/cover.jpg").unwrap();
 
         let error = downloader.download_url(&disallowed).await.unwrap_err();
-        assert!(matches!(error, AppError::Download(_)));
+        assert!(matches!(error, Error::Download(_)));
     }
 
     #[test]

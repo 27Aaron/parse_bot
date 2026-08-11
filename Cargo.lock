@@ -1085,8 +1085,8 @@ dependencies = [
  "hex",
  "libc",
  "parking_lot",
+ "parse-core",
  "regex",
- "reqwest",
  "rusqlite",
  "serde",
  "serde_json",
@@ -1097,6 +1097,27 @@ dependencies = [
  "tokio-util",
  "tracing",
  "tracing-subscriber",
+ "url",
+ "uuid",
+]
+
+[[package]]
+name = "parse-core"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "dotenvy",
+ "futures-util",
+ "hex",
+ "libc",
+ "regex",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror",
+ "tokio",
+ "tracing",
  "url",
  "uuid",
 ]

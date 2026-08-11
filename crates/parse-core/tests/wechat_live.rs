@@ -1,6 +1,6 @@
 use std::{collections::HashSet, env, path::PathBuf, time::Duration};
 
-use parse_bot::{
+use parse_core::{
     media::{MediaDownloader, decrypt_file_prefix, probe_media},
     model::{MediaSource, MediaSourceKind, ResolvedPost},
     wechat::WechatResolver,

@@ -15,7 +15,7 @@ use serde_json::Value;
 use tokio::{io::AsyncReadExt, process::Command, time::timeout};
 
 use crate::{
-    error::{AppError, Result},
+    error::{Error, Result},
     model::VideoCodec,
 };
 
@@ -45,11 +45,9 @@ pub async fn probe_media(path: impl AsRef<Path>) -> Result<MediaProbe> {
     let path = path.as_ref();
     let metadata = tokio::fs::metadata(path)
         .await
-        .map_err(|_| AppError::InvalidMedia("媒体文件无法读取".to_owned()))?;
+        .map_err(|_| Error::InvalidMedia("媒体文件无法读取".to_owned()))?;
     if !metadata.is_file() || metadata.len() == 0 {
-        return Err(AppError::InvalidMedia(
-            "媒体文件为空或不是普通文件".to_owned(),
-        ));
+        return Err(Error::InvalidMedia("媒体文件为空或不是普通文件".to_owned()));
     }
 
     let ffprobe_path = resolve_ffprobe_from_environment()?;
@@ -83,10 +81,10 @@ pub async fn probe_media(path: impl AsRef<Path>) -> Result<MediaProbe> {
 
     let mut child = match command.spawn() {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Err(AppError::Config("未找到 ffprobe 可执行文件".to_owned()));
+            return Err(Error::Config("未找到 ffprobe 可执行文件".to_owned()));
         }
         Err(_) => {
-            return Err(AppError::Config(
+            return Err(Error::Config(
                 "无法启动 ffprobe，请检查执行权限和进程资源限制".to_owned(),
             ));
         }
@@ -95,7 +93,7 @@ pub async fn probe_media(path: impl AsRef<Path>) -> Result<MediaProbe> {
     let stdout = child
         .stdout
         .take()
-        .ok_or_else(|| AppError::InvalidMedia("无法读取 ffprobe 输出".to_owned()))?;
+        .ok_or_else(|| Error::InvalidMedia("无法读取 ffprobe 输出".to_owned()))?;
 
     let probe_result = timeout(FFPROBE_TIMEOUT, async move {
         let mut json = Vec::new();
@@ -103,24 +101,22 @@ pub async fn probe_media(path: impl AsRef<Path>) -> Result<MediaProbe> {
             .take((MAX_PROBE_JSON_BYTES + 1) as u64)
             .read_to_end(&mut json)
             .await
-            .map_err(|_| AppError::InvalidMedia("无法读取 ffprobe 输出".to_owned()))?;
+            .map_err(|_| Error::InvalidMedia("无法读取 ffprobe 输出".to_owned()))?;
         if json.len() > MAX_PROBE_JSON_BYTES {
             let _ = child.kill().await;
             let _ = child.wait().await;
-            return Err(AppError::InvalidMedia(
-                "ffprobe 返回的数据异常过大".to_owned(),
-            ));
+            return Err(Error::InvalidMedia("ffprobe 返回的数据异常过大".to_owned()));
         }
         let status = child
             .wait()
             .await
-            .map_err(|_| AppError::InvalidMedia("无法等待 ffprobe".to_owned()))?;
+            .map_err(|_| Error::InvalidMedia("无法等待 ffprobe".to_owned()))?;
         Ok((status, json))
     })
     .await;
 
     let (status, json) = match probe_result {
-        Err(_) => return Err(AppError::InvalidMedia("ffprobe 执行超时".to_owned())),
+        Err(_) => return Err(Error::InvalidMedia("ffprobe 执行超时".to_owned())),
         Ok(result) => result?,
     };
 
@@ -128,7 +124,7 @@ pub async fn probe_media(path: impl AsRef<Path>) -> Result<MediaProbe> {
         let code = status
             .code()
             .map_or_else(|| "signal".to_owned(), |code| code.to_string());
-        return Err(AppError::InvalidMedia(format!(
+        return Err(Error::InvalidMedia(format!(
             "ffprobe 检查失败（退出状态 {code}）"
         )));
     }
@@ -203,9 +199,7 @@ fn resolve_ffprobe_path(
         .into_iter()
         .find_map(|candidate| canonical_executable(&candidate))
         .ok_or_else(|| {
-            AppError::Config(
-                "未找到安全的 ffprobe 可执行文件，请设置绝对路径 FFPROBE_PATH".to_owned(),
-            )
+            Error::Config("未找到安全的 ffprobe 可执行文件，请设置绝对路径 FFPROBE_PATH".to_owned())
         })
 }
 
@@ -267,8 +261,8 @@ fn executable_path_is_trusted(_path: &Path, _metadata: &fs::Metadata) -> bool {
     true
 }
 
-fn invalid_configured_ffprobe() -> AppError {
-    AppError::Config("FFPROBE_PATH 必须是指向普通可执行文件的绝对路径".to_owned())
+fn invalid_configured_ffprobe() -> Error {
+    Error::Config("FFPROBE_PATH 必须是指向普通可执行文件的绝对路径".to_owned())
 }
 
 #[derive(Debug, Deserialize)]
@@ -331,18 +325,18 @@ struct ProbeFormat {
 
 fn parse_probe_json(json: &[u8]) -> Result<MediaProbe> {
     let document: ProbeDocument = serde_json::from_slice(json)
-        .map_err(|_| AppError::InvalidMedia("ffprobe 返回了无效 JSON".to_owned()))?;
+        .map_err(|_| Error::InvalidMedia("ffprobe 返回了无效 JSON".to_owned()))?;
 
     let video = choose_video_stream(&document.streams)
-        .ok_or_else(|| AppError::InvalidMedia("文件中没有视频流".to_owned()))?;
+        .ok_or_else(|| Error::InvalidMedia("文件中没有视频流".to_owned()))?;
     let coded_width = video
         .width
         .filter(|value| *value > 0)
-        .ok_or_else(|| AppError::InvalidMedia("视频宽度无效".to_owned()))?;
+        .ok_or_else(|| Error::InvalidMedia("视频宽度无效".to_owned()))?;
     let coded_height = video
         .height
         .filter(|value| *value > 0)
-        .ok_or_else(|| AppError::InvalidMedia("视频高度无效".to_owned()))?;
+        .ok_or_else(|| Error::InvalidMedia("视频高度无效".to_owned()))?;
     let (width, height) = visible_dimensions(video, coded_width, coded_height);
 
     let duration_seconds = parse_duration(video.duration.as_ref()).or_else(|| {
@@ -524,7 +518,7 @@ mod tests {
     fn configured_ffprobe_path_must_be_absolute() {
         assert!(matches!(
             resolve_ffprobe_path(Some(OsStr::new("bin/ffprobe")), None),
-            Err(AppError::Config(_))
+            Err(Error::Config(_))
         ));
     }
 
@@ -569,15 +563,15 @@ mod tests {
 
         assert!(matches!(
             resolve_ffprobe_path(Some(non_executable.as_os_str()), None),
-            Err(AppError::Config(_))
+            Err(Error::Config(_))
         ));
         assert!(matches!(
             resolve_ffprobe_path(Some(directory.path().as_os_str()), None),
-            Err(AppError::Config(_))
+            Err(Error::Config(_))
         ));
         assert!(matches!(
             resolve_ffprobe_path(Some(writable_by_others.as_os_str()), None),
-            Err(AppError::Config(_))
+            Err(Error::Config(_))
         ));
     }
 
@@ -697,7 +691,7 @@ mod tests {
 
         assert!(matches!(
             parse_probe_json(json),
-            Err(AppError::InvalidMedia(_))
+            Err(Error::InvalidMedia(_))
         ));
     }
 

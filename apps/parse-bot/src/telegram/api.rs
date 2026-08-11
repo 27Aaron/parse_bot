@@ -8,7 +8,7 @@ use std::{
 use regex::Regex;
 use url::Url;
 
-use crate::{AppError, model::TelegramMediaKind};
+use crate::{AppError, telegram::TelegramMediaKind};
 
 pub use super::tdlib::TelegramClient;
 
