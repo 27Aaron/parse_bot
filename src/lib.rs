@@ -1,8 +1,8 @@
-//! Telegram delivery shell for [`parse_core`].
+//! Telegram delivery shell for [`parse_core`](https://github.com/27Aaron/Parse).
 //!
 //! This package owns chat interaction, persistence, and process configuration.
-//! Platform resolve/download logic lives in `parse-core` so other delivery
-//! targets (Feishu, CLI, …) can reuse it without this bot.
+//! Platform resolve/download logic lives in the separate Parse repository so
+//! other delivery targets (Feishu, CLI, …) can reuse the same core.
 
 pub mod config;
 pub mod error;

@@ -1,0 +1,9 @@
+# Copy to `.cargo/config.toml` when developing Parse and parse_bot side-by-side
+# without pushing every Parse change first:
+#
+#   cp .cargo/config.toml.example .cargo/config.toml
+#
+# Requires a sibling checkout: ../Parse
+
+[patch."https://github.com/27Aaron/Parse.git"]
+parse-core = { path = "../Parse" }

@@ -1104,17 +1104,15 @@ dependencies = [
 [[package]]
 name = "parse-core"
 version = "0.1.0"
+source = "git+https://github.com/27Aaron/Parse.git?branch=main#1632afd37cc398e62f27ffd533e8777170e4600c"
 dependencies = [
  "chrono",
- "dotenvy",
  "futures-util",
- "hex",
  "libc",
  "regex",
  "reqwest",
  "serde",
  "serde_json",
- "sha2",
  "thiserror",
  "tokio",
  "tracing",
