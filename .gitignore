@@ -7,6 +7,9 @@
 .env.local
 .env.*.local
 
+# Local path override for a sibling Parse checkout (see .cargo/config.toml.example)
+.cargo/config.toml
+
 # Rust build artifacts
 target/
 **/*.rs.bk
