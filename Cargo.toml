@@ -15,7 +15,7 @@ path = "src/main.rs"
 # Resolving/download core lives in https://github.com/27Aaron/Parse
 # Pin to main while the API is early; switch to a rev/tag for production freezes.
 parse-core = { git = "https://github.com/27Aaron/Parse.git", branch = "main" }
-base64 = "0.22"
+base64 = "0.23"
 chrono = "0.4"
 dotenvy = "0.15"
 futures-util = "0.3"
